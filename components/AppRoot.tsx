@@ -653,6 +653,7 @@ function ChatInterface({ onComplete, darkMode }: { onComplete: () => void; darkM
     blogDirName,
     blogPosts,
     blogMedia,
+    blogAuthorLabels,
     blogSelectedPostIds,
     setBlogSelectedPostIds,
     blogDirHandle,
@@ -693,7 +694,7 @@ function ChatInterface({ onComplete, darkMode }: { onComplete: () => void; darkM
       const openAiMessages: { role: 'system' | 'user' | 'assistant'; content: string }[] = [
         { role: 'system', content: CHAT_SYSTEM_PROMPT },
       ];
-      const blogContext = buildBlogContextText(selectedPosts, selectedMedia);
+      const blogContext = buildBlogContextText(selectedPosts, selectedMedia, blogAuthorLabels);
       if (blogContext) openAiMessages.push({ role: 'system', content: blogContext });
       for (const m of history) openAiMessages.push({ role: m.role, content: m.text });
 
@@ -730,6 +731,7 @@ function ChatInterface({ onComplete, darkMode }: { onComplete: () => void; darkM
         chatHistory: useStore.getState().chatMessages,
         blogPosts: selectedPosts,
         blogMedia: selectedMedia,
+        blogAuthorLabels,
         settings: { baseUrl: llmBaseUrl, model: llmModel },
       });
 

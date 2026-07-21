@@ -148,9 +148,30 @@ app/api/export/video/     씬별 세그먼트 인코딩 → concat → 자막 �
 - `posts.json`, `media-meta.json`(사진/영상별 캡션·장소·날짜), `uploads/YYYY/MM/파일명`
 - `lib/blogData.ts`의 `readBlogData()`가 File System Access API로 이 폴더를 읽고,
   `resolveUploadFileHandle()`이 `media-meta.json`의 `url`(`/api/uploads/...`)을 실제 파일로 변환합니다.
-- **절대 규칙**: LLM이 스토리보드를 생성할 때 사용할 사진/영상은 반드시 `media-meta.json`에 실제로
-  존재하는 `id` 값이어야 합니다 (`lib/llm.ts`의 `STORYBOARD_JSON_INSTRUCTION` + `mediaId` 검증 로직).
-  LLM이 지어낸 파일명/캡션을 그대로 믿고 사용하지 마세요. 이 검증을 제거하지 마세요.
+- **⚠️ 2026-07-22 실데이터 검증으로 밝혀진 핵심 사실 — 반드시 유지할 것**: 블로그의 실제 소스코드
+  (`lib/mediaMeta.ts`, `lib/extractMedia.ts`)를 직접 확인한 결과, "원본"은 항상 글 `content`(HTML)
+  안의 `<img>`/`<video>` 태그이고, `media-meta.json`은 그중 `data-media-id`가 붙은 태그만 골라
+  캡션/장소를 저장하는 **보조 색인일 뿐**입니다. 즉:
+  - `media-meta.json` 파일 자체가 아예 없는 데이터 폴더도 정상입니다 (아직 "글 저장"이 한 번도
+    안 됐거나 구버전 데이터). 사용자가 실제로 준 테스트 데이터(`posts.json`)에도 media-meta.json이
+    없었습니다.
+  - `data-media-id`가 없는 `<img>`(붙여넣기로 들어간 사진 등)는 media-meta.json에 절대 안 잡힙니다.
+  - 그래서 `lib/blogData.ts`는 **media-meta.json만 보고 판단하지 않습니다.** 항상 각 글의
+    `content`를 직접 정규식으로 파싱(`parseMediaTagsFromContent`)해 미디어를 먼저 찾고,
+    `media-meta.json`에 같은 `mediaId`의 항목이 있으면 그걸로 캡션/장소를 보강(`buildMediaForPost`)
+    합니다. media-meta.json에 없는 사진은 `content_<postId>_<index>` 형태의 합성 id를 붙여
+    캡션 없이(빈 문자열) 사용합니다 — **이 합성 id도 실제 파일(url)에 그대로 연결되므로
+    사진 자체를 놓치지 않습니다.** 이 이중 처리(본문 파싱 우선 + media-meta 보강)를 하나로
+    합치거나 media-meta.json 단독 의존으로 되돌리지 마세요 — 실사용 데이터 대부분이 깨집니다.
+  - `settings.json`의 `authorLabels`(작성자 코드→표시 이름)도 함께 읽어(`resolveAuthorLabel`)
+    LLM 프롬프트와 UI에 "gyeongwoo" 같은 내부 코드 대신 사람이 보는 이름("경우" 등)을 씁니다.
+  - 이 로직은 `scripts_tmp_test/verify_blog_llm.ts`(검증 후 삭제됨)로 사용자가 준 실제
+    `posts.json`을 대상으로 실행해 확인했습니다: media-meta.json 없이도 본문 속 사진을 정확히
+    찾아냈고, LLM이 존재하지 않는 mediaId를 지어내면 `null`로 정확히 걸러졌습니다.
+- **절대 규칙**: LLM이 스토리보드를 생성할 때 사용할 사진/영상은 반드시 `lib/blogData.ts`가
+  만든 `media` 목록에 실제로 존재하는 `id` 값이어야 합니다 (`lib/llm.ts`의
+  `STORYBOARD_JSON_INSTRUCTION` + `mediaId` 검증 로직). LLM이 지어낸 파일명/캡션을 그대로 믿고
+  사용하지 마세요. 이 검증을 제거하지 마세요.
 - `BlogImportModal`(`components/AppRoot.tsx`)에서 날짜 범위로 글을 찾아 선택하면, 그 글/미디어가
   채팅의 컨텍스트로 들어갑니다 (`blogSelectedPostIds` in store).
 
@@ -263,3 +284,12 @@ Next.js 서버까지 연결한 end-to-end 테스트(`yarn dev` 구동)는 네트
      (`lib/subtitles.ts`, `lib/server/ffmpeg.ts`, `app/api/export/video/*`, `ExportModal`).
   네트워크가 막힌 샌드박스라 `yarn install`은 못 했지만, esbuild로 전체 `.ts`/`.tsx` 구문 검사를
   통과했고, ffmpeg 파이프라인은 실제 설치된 ffmpeg으로 더미 자산을 렌더링해 검증함(섹션 8, 12 참고).
+- **2026-07-22 (같은 날 추가 세션)**: 사용자가 실제 블로그 프로젝트 소스+테스트 데이터(zip)를 줘서
+  블로그 연동을 실데이터로 검증. **버그 발견 및 수정**: `media-meta.json`이 없거나(테스트 데이터가
+  정확히 이 경우였음) `data-media-id` 없는 사진은 이전 구현(media-meta.json 단독 의존)에서는
+  전혀 찾지 못했음. `lib/blogData.ts`를 글 `content` HTML 직접 파싱 우선 + media-meta.json 보강
+  방식으로 재작성(`parseMediaTagsFromContent`, `buildMediaForPost` 추가) — 섹션 6 참고. 부가로
+  `settings.json`의 `authorLabels`를 읽어 LLM 프롬프트에 작성자 실명 표시 추가
+  (`resolveAuthorLabel`, `store.blogAuthorLabels`). `lib/llm.ts`/`lib/blogData.ts`를 tsx로 직접
+  실행해 사용자가 준 실제 posts.json으로 전체 파이프라인(미디어 추출 → LLM 응답 모킹 →
+  mediaId 검증)을 end-to-end 테스트해 통과 확인.

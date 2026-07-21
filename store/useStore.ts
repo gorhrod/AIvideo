@@ -260,6 +260,7 @@ interface AppState {
   blogPosts: BlogPost[];
   blogMedia: BlogMediaMeta[];
   blogCategories: BlogCategory[];
+  blogAuthorLabels: Record<string, string>;
   connectBlogDataFolder: () => Promise<{ ok: boolean; message?: string }>;
   disconnectBlogDataFolder: () => void;
   /** 블로그 가져오기 모달에서 선택한 글 id들 — 채팅에 첨부되어 스토리보드 생성 시 미디어 후보로 사용됩니다. */
@@ -685,6 +686,7 @@ export const useStore = create<AppState>((set, get) => {
     blogPosts: [],
     blogMedia: [],
     blogCategories: [],
+    blogAuthorLabels: { gyeongwoo: '경우', jungmin: '정민', other: '기타' },
     connectBlogDataFolder: async () => {
       const handle = await pickDirectory('read');
       if (!handle) return { ok: false, message: '폴더 선택이 취소되었습니다.' };
@@ -704,13 +706,14 @@ export const useStore = create<AppState>((set, get) => {
           blogPosts: data.posts,
           blogMedia: data.media,
           blogCategories: data.categories,
+          blogAuthorLabels: data.authorLabels,
         });
         addLogEntry('blog_connect', `블로그 데이터 폴더 연결됨: "${handle.name}" (글 ${data.posts.length}개)`);
         return {
           ok: true,
-          message: data.hasMediaMeta
-            ? `블로그 글 ${data.posts.length}개, 미디어 ${data.media.length}개를 불러왔습니다.`
-            : `블로그 글 ${data.posts.length}개를 불러왔습니다. (media-meta.json이 없어 사진/영상 매칭은 되지 않습니다)`,
+          message: `블로그 글 ${data.posts.length}개, 사진/영상 ${data.media.length}개를 불러왔습니다.${
+            data.hasMediaMetaFile ? '' : ' (media-meta.json은 없지만, 글 본문에서 사진/영상을 직접 찾았습니다)'
+          }`,
         };
       } catch (err) {
         console.error(err);

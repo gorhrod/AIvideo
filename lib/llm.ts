@@ -8,7 +8,7 @@
 // 다른 클라우드 LLM API는 호출하지 않습니다.
 
 import type { BlogMediaMeta, BlogPost } from '@/lib/blogData';
-import { stripHtml } from '@/lib/blogData';
+import { stripHtml, resolveAuthorLabel } from '@/lib/blogData';
 import type { ChatMessage, Scene } from '@/store/useStore';
 
 export interface LlmSettings {
@@ -129,11 +129,17 @@ export const CHAT_SYSTEM_PROMPT = `당신은 KWJMvideoAI의 영상 스토리보�
 답변은 3~6문장 정도로 간결하게 하고, 대화가 충분히 구체화되면 사용자가 화면 하단의
 "스토리보드로 만들기" 버튼을 눌러 실제 장면을 생성할 수 있다는 점을 자연스럽게 안내해도 좋습니다.`;
 
-export function buildBlogContextText(posts: BlogPost[], media: BlogMediaMeta[]): string {
+export function buildBlogContextText(
+  posts: BlogPost[],
+  media: BlogMediaMeta[],
+  authorLabels?: Record<string, string>
+): string {
   if (posts.length === 0) return '';
   const lines: string[] = ['[연결된 블로그 데이터]'];
   for (const post of posts) {
-    lines.push(`- 글 id=${post.id} / 제목: "${post.title}" / 작성자: ${post.author} / 날짜: ${post.createdAt.slice(0, 10)}${post.location ? ` / 장소: ${post.location}` : ''}`);
+    lines.push(
+      `- 글 id=${post.id} / 제목: "${post.title}" / 작성자: ${resolveAuthorLabel(post.author, authorLabels)} / 날짜: ${post.createdAt.slice(0, 10)}${post.location ? ` / 장소: ${post.location}` : ''}`
+    );
     const text = stripHtml(post.content).slice(0, 300);
     if (text) lines.push(`  본문 요약: ${text}`);
     const postMedia = media.filter((m) => m.postId === post.id).sort((a, b) => a.order - b.order);
@@ -196,13 +202,14 @@ export async function generateStoryboardFromChat(params: {
   chatHistory: ChatMessage[];
   blogPosts?: BlogPost[];
   blogMedia?: BlogMediaMeta[];
+  blogAuthorLabels?: Record<string, string>;
   settings: LlmSettings;
 }): Promise<{ scenes: Omit<Scene, 'id'>[]; rawMediaIds: (string | null)[] }> {
-  const { chatHistory, blogPosts = [], blogMedia = [], settings } = params;
+  const { chatHistory, blogPosts = [], blogMedia = [], blogAuthorLabels, settings } = params;
 
   const messages: OpenAiMessage[] = [{ role: 'system', content: CHAT_SYSTEM_PROMPT }];
 
-  const blogContext = buildBlogContextText(blogPosts, blogMedia);
+  const blogContext = buildBlogContextText(blogPosts, blogMedia, blogAuthorLabels);
   if (blogContext) {
     messages.push({ role: 'system', content: blogContext });
   }
