@@ -17,6 +17,22 @@ import {
 } from '@/lib/fsAccess';
 import { cn, getSceneImageSrc, formatShortDateTime } from '@/lib/utils';
 import {
+  filterPostsByDateRange,
+  getMediaForPosts,
+  blogMediaPreviewUrl,
+  blogMediaFileName,
+  type BlogMediaMeta,
+} from '@/lib/blogData';
+import {
+  streamChat,
+  checkLlmHealth,
+  generateStoryboardFromChat,
+  regenerateSceneNarration,
+  CHAT_SYSTEM_PROMPT,
+  buildBlogContextText,
+} from '@/lib/llm';
+import { buildSrt, buildPlainTextScript, totalDuration } from '@/lib/subtitles';
+import {
   Film,
   MessageSquare,
   FolderOpen,
@@ -49,6 +65,10 @@ import {
   Link2Off,
   Video,
   Info,
+  Settings,
+  Newspaper,
+  Send,
+  Wand2,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
@@ -93,6 +113,71 @@ function getRecommendations(scene: Scene): string[] {
   return shuffled.slice(0, 4);
 }
 
+/**
+ * LLM이 골라준 mediaId(블로그 media-meta의 id)를 실제 사진/영상 파일로 변환해 씬에 채워 넣습니다.
+ * mediaId가 없거나 파일을 찾지 못하면 태그 기반 추천 이미지로 대체합니다.
+ */
+async function resolveScenesWithBlogMedia(
+  scenes: Omit<Scene, 'id'>[],
+  mediaIds: (string | null)[],
+  blogDirHandle: any,
+  blogMedia: BlogMediaMeta[]
+): Promise<Scene[]> {
+  const result: Scene[] = [];
+  for (let i = 0; i < scenes.length; i++) {
+    const base = scenes[i];
+    const mediaId = mediaIds[i];
+    let photoRef = '';
+    let localImageName: string | undefined;
+    let localVideoName: string | undefined;
+    let localVideoUrl: string | undefined;
+    let sourceMediaId: string | undefined;
+    let sourcePostId: string | undefined;
+
+    if (mediaId && blogDirHandle) {
+      const item = blogMedia.find((m) => m.id === mediaId);
+      if (item) {
+        try {
+          const url = await blogMediaPreviewUrl(blogDirHandle, item);
+          if (url) {
+            if (item.type === 'video') {
+              localVideoName = blogMediaFileName(item.url);
+              localVideoUrl = url;
+            } else {
+              localImageName = blogMediaFileName(item.url);
+              photoRef = url;
+            }
+            sourceMediaId = item.id;
+            sourcePostId = item.postId;
+          }
+        } catch (err) {
+          console.error('블로그 미디어를 불러오지 못했습니다:', err);
+        }
+      }
+    }
+
+    if (!photoRef && !localVideoUrl) {
+      photoRef = getRecommendations({ tags: base.tags } as Scene)[0] ?? RECOMMEND_POOLS.beach[0];
+    }
+
+    result.push({
+      id: genId('scene'),
+      ...base,
+      photoRef,
+      localImageName,
+      localVideoName,
+      localVideoUrl,
+      sourceMediaId,
+      sourcePostId,
+    });
+  }
+  return result;
+}
+
+function genId(prefix: string): string {
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
 // ─── Main App ─────────────────────────────────────────────────────────────────
 
 export default function AppRoot() {
@@ -106,7 +191,7 @@ export default function AppRoot() {
   return (
     <div
       className={cn(
-        'min-h-screen w-full flex flex-col font-sans transition-colors duration-300',
+        'h-dvh w-full flex flex-col font-sans transition-colors duration-300 overflow-hidden',
         darkMode ? 'bg-neutral-950 text-neutral-100' : 'bg-neutral-50 text-neutral-900'
       )}
     >
@@ -170,23 +255,29 @@ export default function AppRoot() {
               onClick={() => setModal('media')}
               darkMode={darkMode}
             />
+            <HeaderNavBtn
+              icon={<Newspaper className="w-3.5 h-3.5" />}
+              label="블로그에서 가져오기"
+              onClick={() => setModal('blog-import')}
+              darkMode={darkMode}
+            />
           </nav>
         </div>
 
         <div className="flex items-center gap-3">
-          {/* LLM Status — 참고: 실제 LM Studio 연결 여부를 확인하지 않는 데모용 표시입니다 */}
-          <div
+          <LlmStatusBadge darkMode={darkMode} onClick={() => setModal('settings')} />
+
+          {/* 설정 */}
+          <button
+            onClick={() => setModal('settings')}
+            title="LM Studio / FFmpeg 설정"
             className={cn(
-              'hidden md:flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-full border',
-              darkMode
-                ? 'border-neutral-800 bg-neutral-900 text-neutral-400'
-                : 'border-neutral-200 bg-neutral-50 text-neutral-500'
+              'w-8 h-8 flex items-center justify-center rounded-lg transition-colors',
+              darkMode ? 'hover:bg-neutral-800 text-neutral-400' : 'hover:bg-neutral-100 text-neutral-500'
             )}
-            title="채팅의 AI 응답은 데모용 시뮬레이션입니다. 실제 LM Studio 연동은 별도 설정이 필요합니다."
           >
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-            <span>LM Studio 연결됨 (데모)</span>
-          </div>
+            <Settings className="w-4 h-4" />
+          </button>
 
           {/* Dark mode */}
           <button
@@ -207,7 +298,7 @@ export default function AppRoot() {
       <StorageBar darkMode={darkMode} />
 
       {/* ── Main ───────────────────────────────────────────────────────────── */}
-      <main className="flex-1 overflow-hidden flex">
+      <main className="flex-1 min-h-0 overflow-hidden flex">
         <AnimatePresence mode="wait">
           {view === 'chat' ? (
             <motion.div
@@ -249,8 +340,65 @@ export default function AppRoot() {
         {modal === 'media' && (
           <MediaLibraryModal darkMode={darkMode} onClose={() => setModal(null)} />
         )}
+        {modal === 'settings' && (
+          <SettingsModal darkMode={darkMode} onClose={() => setModal(null)} />
+        )}
+        {modal === 'blog-import' && (
+          <BlogImportModal darkMode={darkMode} onClose={() => setModal(null)} />
+        )}
       </AnimatePresence>
     </div>
+  );
+}
+
+// ─── LLM(LM Studio) 연결 상태 배지 ──────────────────────────────────────────────
+
+function LlmStatusBadge({ darkMode, onClick }: { darkMode: boolean; onClick: () => void }) {
+  const { llmBaseUrl, llmModel, llmStatus, setLlmStatus, setLlmAvailableModels } = useStore();
+
+  useEffect(() => {
+    let cancelled = false;
+    const check = async () => {
+      setLlmStatus('checking');
+      const health = await checkLlmHealth(llmBaseUrl);
+      if (cancelled) return;
+      setLlmStatus(health.ok ? 'online' : 'offline');
+      if (health.ok) setLlmAvailableModels(health.models);
+    };
+    check();
+    const interval = setInterval(check, 20000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [llmBaseUrl]);
+
+  const dotColor =
+    llmStatus === 'online' ? 'bg-emerald-500' : llmStatus === 'offline' ? 'bg-rose-500' : 'bg-neutral-400';
+  const label =
+    llmStatus === 'online'
+      ? `LM Studio 연결됨 (${llmModel})`
+      : llmStatus === 'offline'
+      ? 'LM Studio 연결 안 됨'
+      : llmStatus === 'checking'
+      ? '연결 확인 중...'
+      : 'LM Studio';
+
+  return (
+    <button
+      onClick={onClick}
+      title="클릭하여 LM Studio 설정 열기"
+      className={cn(
+        'hidden md:flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-full border transition-colors',
+        darkMode
+          ? 'border-neutral-800 bg-neutral-900 text-neutral-400 hover:border-neutral-700'
+          : 'border-neutral-200 bg-neutral-50 text-neutral-500 hover:border-neutral-300'
+      )}
+    >
+      <span className={cn('w-1.5 h-1.5 rounded-full', dotColor, llmStatus === 'checking' && 'animate-pulse')} />
+      <span>{label}</span>
+    </button>
   );
 }
 
@@ -496,43 +644,121 @@ function StorageBar({ darkMode }: { darkMode: boolean }) {
 // ─── Chat Interface ───────────────────────────────────────────────────────────
 
 function ChatInterface({ onComplete, darkMode }: { onComplete: () => void; darkMode: boolean }) {
-  const { chatMessages: messages, addChatMessage } = useStore();
+  const {
+    chatMessages: messages,
+    addChatMessage,
+    llmBaseUrl,
+    llmModel,
+    llmStatus,
+    blogDirName,
+    blogPosts,
+    blogMedia,
+    blogSelectedPostIds,
+    setBlogSelectedPostIds,
+    blogDirHandle,
+    setScenes,
+    setSelectedSceneId,
+    setCurrentProject,
+    setModal,
+    pushEditLog,
+  } = useStore();
   const [input, setInput] = useState('');
-  const [isProcessing, setIsProcessing] = useState(false);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [streamingText, setStreamingText] = useState('');
+  const [isBuildingStoryboard, setIsBuildingStoryboard] = useState(false);
+  const [buildStage, setBuildStage] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+  }, [messages, streamingText]);
 
-  const handleSend = () => {
-    if (!input.trim() || isProcessing) return;
+  const selectedPosts = blogPosts.filter((p) => blogSelectedPostIds.includes(p.id));
+  const selectedMedia = getMediaForPosts(blogMedia, blogSelectedPostIds);
+
+  const handleSend = async () => {
+    if (!input.trim() || isStreaming) return;
     const userMsg = input.trim();
     addChatMessage('user', userMsg);
     setInput('');
-    setIsProcessing(true);
+    setIsStreaming(true);
+    setStreamingText('');
 
-    // 참고: 아래 응답은 실제 LLM 연동 없이 흐름을 보여주는 데모 응답입니다.
-    // 실제 LM Studio 연동 시 이 setTimeout 블록을 API 호출로 교체하면 됩니다.
-    setTimeout(() => {
-      addChatMessage('assistant', '블로그 데이터를 분석하고 키워드를 추출하는 중입니다...');
+    const controller = new AbortController();
+    abortRef.current = controller;
 
-      setTimeout(() => {
-        addChatMessage('assistant', '이미지를 분류하고 장면을 구성하는 중입니다. 잠시만 기다려주세요.');
+    try {
+      const history = [...useStore.getState().chatMessages];
+      const openAiMessages: { role: 'system' | 'user' | 'assistant'; content: string }[] = [
+        { role: 'system', content: CHAT_SYSTEM_PROMPT },
+      ];
+      const blogContext = buildBlogContextText(selectedPosts, selectedMedia);
+      if (blogContext) openAiMessages.push({ role: 'system', content: blogContext });
+      for (const m of history) openAiMessages.push({ role: m.role, content: m.text });
 
-        setTimeout(() => {
-          addChatMessage(
-            'assistant',
-            `"${userMsg}" 요청을 바탕으로 5개 장면의 스토리보드를 생성했습니다!\n\n각 장면에는 나레이션, 대사, 추천 이미지가 포함되어 있습니다. 편집기에서 내용을 자유롭게 수정하실 수 있습니다.`
-          );
-          setIsProcessing(false);
+      let full = '';
+      await streamChat(openAiMessages, {
+        baseUrl: llmBaseUrl,
+        model: llmModel,
+        temperature: 0.7,
+        signal: controller.signal,
+        onToken: (chunk) => {
+          full += chunk;
+          setStreamingText(full);
+        },
+      });
+      addChatMessage('assistant', full.trim() || '(빈 응답을 받았습니다)');
+    } catch (err) {
+      addChatMessage(
+        'assistant',
+        `⚠️ LM Studio 서버(${llmBaseUrl})에 연결하지 못했습니다. LM Studio 앱에서 "Local Server"가 켜져 있고, 모델(${llmModel})이 로드되어 있는지 확인한 뒤 다시 시도해주세요. 헤더의 "설정"에서 주소/모델을 바꿀 수 있습니다.`
+      );
+    } finally {
+      setIsStreaming(false);
+      setStreamingText('');
+      abortRef.current = null;
+    }
+  };
 
-          setTimeout(() => {
-            onComplete();
-          }, 1200);
-        }, 1800);
-      }, 1500);
-    }, 1000);
+  const handleBuildStoryboard = async () => {
+    if (isBuildingStoryboard || isStreaming) return;
+    setIsBuildingStoryboard(true);
+    setBuildStage('대화 내용을 분석하는 중...');
+    try {
+      const { scenes: rawScenes, rawMediaIds } = await generateStoryboardFromChat({
+        chatHistory: useStore.getState().chatMessages,
+        blogPosts: selectedPosts,
+        blogMedia: selectedMedia,
+        settings: { baseUrl: llmBaseUrl, model: llmModel },
+      });
+
+      setBuildStage('사진·영상을 장면에 배치하는 중...');
+      const resolved = await resolveScenesWithBlogMedia(rawScenes, rawMediaIds, blogDirHandle, selectedMedia);
+
+      setScenes(resolved);
+      setSelectedSceneId(resolved[0]?.id ?? null);
+      const now = new Date().toISOString();
+      setCurrentProject({
+        id: genId('proj'),
+        name: resolved[0]?.customTitle ? `${resolved[0].customTitle} 외 ${resolved.length - 1}개 장면` : '새 스토리보드',
+        folderPath: '',
+        createdAt: now,
+        modifiedAt: now,
+        scenes: resolved,
+      });
+      pushEditLog('storyboard_generate', `채팅 내용으로 스토리보드 생성 (${resolved.length}개 장면)`);
+      addChatMessage('assistant', `🎬 ${resolved.length}개 장면으로 스토리보드를 만들었어요! 편집기로 이동합니다.`);
+      onComplete();
+    } catch (err: any) {
+      addChatMessage(
+        'assistant',
+        `⚠️ 스토리보드를 만드는 중 문제가 발생했습니다 (${err?.message ?? '알 수 없는 오류'}). LM Studio 연결 상태를 확인하고 다시 시도해주세요.`
+      );
+    } finally {
+      setIsBuildingStoryboard(false);
+      setBuildStage('');
+    }
   };
 
   const suggestions = [
@@ -541,12 +767,15 @@ function ChatInterface({ onComplete, darkMode }: { onComplete: () => void; darkM
     '봄 꽃구경 여행 스토리보드 생성해줘',
   ];
 
+  const hasUserMessage = messages.some((m) => m.role === 'user');
+  const canBuild = hasUserMessage && !isStreaming && !isBuildingStoryboard;
+
   return (
-    <div className="flex-1 flex">
+    <div className="flex-1 flex min-h-0">
       {/* Sidebar tips */}
       <div
         className={cn(
-          'w-72 border-r p-6 shrink-0 hidden lg:flex flex-col gap-6',
+          'w-72 border-r p-6 shrink-0 hidden lg:flex flex-col gap-6 overflow-y-auto scrollbar-hide',
           darkMode ? 'border-neutral-800 bg-neutral-900/30' : 'border-neutral-200 bg-neutral-50/50'
         )}
       >
@@ -554,10 +783,10 @@ function ChatInterface({ onComplete, darkMode }: { onComplete: () => void; darkM
           <h3 className="text-xs font-semibold uppercase tracking-widest text-indigo-500 mb-3">기능 안내</h3>
           <ul className="space-y-3">
             {[
-              { icon: <Sparkles className="w-4 h-4 text-indigo-400" />, text: 'LLM이 블로그 글을 분석해 자동으로 장면을 구성합니다' },
-              { icon: <ImageIcon className="w-4 h-4 text-emerald-400" />, text: '각 장면에 어울리는 이미지를 자동으로 추천합니다' },
-              { icon: <RefreshCw className="w-4 h-4 text-amber-400" />, text: '마음에 들지 않는 이미지는 새로고침으로 교체합니다' },
-              { icon: <Download className="w-4 h-4 text-rose-400" />, text: '완성된 스토리보드를 다양한 형식으로 내보냅니다' },
+              { icon: <Sparkles className="w-4 h-4 text-indigo-400" />, text: 'LM Studio의 로컬 LLM이 대화 내용을 분석해 장면을 구성합니다' },
+              { icon: <Newspaper className="w-4 h-4 text-sky-400" />, text: '블로그 데이터를 가져오면 실제 사진/영상과 캡션을 근거로 장면을 만듭니다' },
+              { icon: <RefreshCw className="w-4 h-4 text-amber-400" />, text: '편집기에서 마음에 들지 않는 나레이션은 AI로 다시 만들 수 있습니다' },
+              { icon: <Download className="w-4 h-4 text-rose-400" />, text: '완성된 스토리보드는 자막이 입혀진 MP4로 내보냅니다' },
             ].map((item, i) => (
               <li key={i} className="flex items-start gap-2.5">
                 <div className="mt-0.5 shrink-0">{item.icon}</div>
@@ -567,6 +796,36 @@ function ChatInterface({ onComplete, darkMode }: { onComplete: () => void; darkM
               </li>
             ))}
           </ul>
+        </div>
+
+        <div>
+          <h3 className="text-xs font-semibold uppercase tracking-widest text-indigo-500 mb-3">블로그 데이터</h3>
+          {blogDirName ? (
+            <div className="space-y-2">
+              <p className={cn('text-xs', darkMode ? 'text-neutral-400' : 'text-neutral-500')}>
+                "{blogDirName}" 연결됨 · 선택한 글 {selectedPosts.length}개
+              </p>
+              <button
+                onClick={() => setModal('blog-import')}
+                className="w-full text-xs px-3 py-2 rounded-lg bg-sky-600 hover:bg-sky-700 text-white font-medium transition-colors"
+              >
+                가져올 글 선택/변경
+              </button>
+            </div>
+          ) : (
+            <button
+              onClick={() => setModal('blog-import')}
+              className={cn(
+                'w-full text-left text-xs px-3 py-2.5 rounded-lg border transition-colors flex items-center gap-2',
+                darkMode
+                  ? 'border-neutral-700 bg-neutral-800/50 hover:border-sky-500 text-neutral-300'
+                  : 'border-neutral-200 bg-white hover:border-sky-300 text-neutral-600'
+              )}
+            >
+              <Newspaper className="w-3.5 h-3.5 text-sky-500 shrink-0" />
+              블로그 데이터 폴더 연결하기
+            </button>
+          )}
         </div>
 
         <div>
@@ -591,14 +850,26 @@ function ChatInterface({ onComplete, darkMode }: { onComplete: () => void; darkM
       </div>
 
       {/* Chat area */}
-      <div className="flex-1 flex flex-col max-w-3xl mx-auto w-full p-6">
+      <div className="flex-1 flex flex-col max-w-3xl mx-auto w-full p-6 min-h-0">
         <div
           className={cn(
-            'flex-1 rounded-2xl border flex flex-col overflow-hidden',
+            'flex-1 min-h-0 rounded-2xl border flex flex-col overflow-hidden',
             darkMode ? 'border-neutral-800 bg-neutral-900/50' : 'border-neutral-200 bg-white shadow-sm'
           )}
         >
-          <div className="flex-1 overflow-y-auto p-6 space-y-5 scrollbar-hide">
+          {blogDirName && selectedPosts.length > 0 && (
+            <div
+              className={cn(
+                'shrink-0 px-4 py-2 text-[11px] flex items-center gap-2 border-b',
+                darkMode ? 'border-neutral-800 bg-sky-500/5 text-sky-300' : 'border-neutral-200 bg-sky-50 text-sky-700'
+              )}
+            >
+              <Newspaper className="w-3 h-3 shrink-0" />
+              <span>블로그 글 {selectedPosts.length}개가 컨텍스트로 연결되어 있습니다: {selectedPosts.map((p) => p.title).join(', ')}</span>
+            </div>
+          )}
+
+          <div className="flex-1 min-h-0 overflow-y-auto p-6 space-y-5 scrollbar-hide">
             {messages.map((msg) => (
               <motion.div
                 key={msg.id}
@@ -625,31 +896,76 @@ function ChatInterface({ onComplete, darkMode }: { onComplete: () => void; darkM
                 </div>
               </motion.div>
             ))}
-            {isProcessing && (
+            {isStreaming && (
               <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="flex justify-start">
                 <div className="w-7 h-7 rounded-full bg-indigo-600 flex items-center justify-center shrink-0 mr-2.5 mt-0.5">
                   <Clapperboard className="w-3.5 h-3.5 text-white" />
                 </div>
-                <div
-                  className={cn(
-                    'rounded-2xl rounded-bl-sm px-4 py-3 flex gap-1.5 items-center',
-                    darkMode ? 'bg-neutral-800' : 'bg-neutral-100'
-                  )}
-                >
-                  {[0, 0.15, 0.3].map((delay, i) => (
-                    <span
-                      key={i}
-                      className="w-2 h-2 rounded-full bg-indigo-500 animate-bounce"
-                      style={{ animationDelay: `${delay}s` }}
-                    />
-                  ))}
-                </div>
+                {streamingText ? (
+                  <div
+                    className={cn(
+                      'max-w-[78%] rounded-2xl rounded-bl-sm px-4 py-3 text-sm leading-relaxed whitespace-pre-line',
+                      darkMode ? 'bg-neutral-800 text-neutral-200' : 'bg-neutral-100 text-neutral-800'
+                    )}
+                  >
+                    {streamingText}
+                    <span className="inline-block w-1.5 h-4 ml-0.5 bg-indigo-400 animate-pulse align-middle" />
+                  </div>
+                ) : (
+                  <div
+                    className={cn(
+                      'rounded-2xl rounded-bl-sm px-4 py-3 flex gap-1.5 items-center',
+                      darkMode ? 'bg-neutral-800' : 'bg-neutral-100'
+                    )}
+                  >
+                    {[0, 0.15, 0.3].map((delay, i) => (
+                      <span
+                        key={i}
+                        className="w-2 h-2 rounded-full bg-indigo-500 animate-bounce"
+                        style={{ animationDelay: `${delay}s` }}
+                      />
+                    ))}
+                  </div>
+                )}
               </motion.div>
             )}
             <div ref={bottomRef} />
           </div>
 
-          <div className={cn('p-4 border-t', darkMode ? 'border-neutral-800' : 'border-neutral-200')}>
+          {/* 스토리보드로 만들기 — 채팅을 계속하다가 준비되면 이 버튼으로 편집기로 이동합니다 */}
+          <div className={cn('shrink-0 px-4 pt-3', darkMode ? '' : '')}>
+            <button
+              onClick={handleBuildStoryboard}
+              disabled={!canBuild}
+              className={cn(
+                'w-full flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-semibold transition-all',
+                !canBuild
+                  ? darkMode
+                    ? 'bg-neutral-800 text-neutral-600 cursor-not-allowed'
+                    : 'bg-neutral-100 text-neutral-400 cursor-not-allowed'
+                  : 'bg-gradient-to-r from-indigo-600 to-fuchsia-600 hover:from-indigo-500 hover:to-fuchsia-500 text-white shadow-md'
+              )}
+            >
+              {isBuildingStoryboard ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  {buildStage || '스토리보드를 만드는 중...'}
+                </>
+              ) : (
+                <>
+                  <Wand2 className="w-4 h-4" />
+                  🎬 스토리보드로 만들기
+                </>
+              )}
+            </button>
+            {!hasUserMessage && (
+              <p className={cn('text-[11px] text-center mt-1.5', darkMode ? 'text-neutral-600' : 'text-neutral-400')}>
+                먼저 어떤 영상을 만들고 싶은지 대화를 시작해주세요.
+              </p>
+            )}
+          </div>
+
+          <div className={cn('p-4 pt-3 border-t mt-3', darkMode ? 'border-neutral-800' : 'border-neutral-200')}>
             <div className="flex gap-2">
               <input
                 type="text"
@@ -657,8 +973,9 @@ function ChatInterface({ onComplete, darkMode }: { onComplete: () => void; darkM
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && handleSend()}
                 placeholder="예: 제주도 가족 여행 감성 브이로그 만들어줘..."
+                disabled={isStreaming}
                 className={cn(
-                  'flex-1 px-4 py-2.5 rounded-xl border text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/40 transition-all',
+                  'flex-1 px-4 py-2.5 rounded-xl border text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/40 transition-all disabled:opacity-60',
                   darkMode
                     ? 'bg-neutral-800 border-neutral-700 text-neutral-100 placeholder:text-neutral-500'
                     : 'bg-neutral-50 border-neutral-300 text-neutral-900 placeholder:text-neutral-400'
@@ -666,12 +983,18 @@ function ChatInterface({ onComplete, darkMode }: { onComplete: () => void; darkM
               />
               <button
                 onClick={handleSend}
-                disabled={isProcessing || !input.trim()}
-                className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm font-medium rounded-xl transition-colors"
+                disabled={isStreaming || !input.trim()}
+                className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm font-medium rounded-xl transition-colors flex items-center gap-1.5"
               >
+                {isStreaming ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
                 보내기
               </button>
             </div>
+            {llmStatus === 'offline' && (
+              <p className="text-[11px] text-rose-500 mt-1.5">
+                LM Studio에 연결되어 있지 않습니다. 헤더의 상태 배지 또는 설정 버튼을 눌러 확인해주세요.
+              </p>
+            )}
           </div>
         </div>
       </div>
@@ -938,8 +1261,9 @@ function SceneCard({
 // ─── Scene Editor (center) ────────────────────────────────────────────────────
 
 function SceneEditor({ scene, darkMode }: { scene: Scene; darkMode: boolean }) {
-  const { updateScene, pushEditLog, setModal } = useStore();
-  const [aiNotice, setAiNotice] = useState(false);
+  const { scenes, updateScene, pushEditLog, setModal, llmBaseUrl, llmModel } = useStore();
+  const [aiNotice, setAiNotice] = useState<{ tone: 'info' | 'error'; text: string } | null>(null);
+  const [aiBusy, setAiBusy] = useState(false);
   const titleDraftRef = useRef(scene.customTitle);
   const narrationDraftRef = useRef(scene.narration);
   const dialogueDraftRef = useRef(scene.dialogue);
@@ -961,9 +1285,28 @@ function SceneEditor({ scene, darkMode }: { scene: Scene; darkMode: boolean }) {
     }
   };
 
-  const handleAiRegenerate = () => {
-    setAiNotice(true);
-    setTimeout(() => setAiNotice(false), 3000);
+  const handleAiRegenerate = async () => {
+    if (aiBusy) return;
+    setAiBusy(true);
+    setAiNotice(null);
+    try {
+      const { narration, dialogue } = await regenerateSceneNarration({
+        scene,
+        allScenes: scenes,
+        settings: { baseUrl: llmBaseUrl, model: llmModel },
+      });
+      updateScene(scene.id, { narration, dialogue });
+      pushEditLog('scene_ai_regenerate', `"${scene.customTitle}" 장면 나레이션 AI 재생성`);
+      setAiNotice({ tone: 'info', text: '나레이션을 새로 만들었습니다.' });
+    } catch (err: any) {
+      setAiNotice({
+        tone: 'error',
+        text: 'LM Studio에 연결하지 못했습니다. 헤더의 "설정"에서 서버 주소/모델을 확인해주세요.',
+      });
+    } finally {
+      setAiBusy(false);
+      setTimeout(() => setAiNotice(null), 4000);
+    }
   };
 
   return (
@@ -1072,19 +1415,24 @@ function SceneEditor({ scene, darkMode }: { scene: Scene; darkMode: boolean }) {
             <div className="relative">
               <button
                 onClick={handleAiRegenerate}
-                className="flex items-center gap-1 text-xs text-indigo-500 hover:text-indigo-600 transition-colors"
+                disabled={aiBusy}
+                className="flex items-center gap-1 text-xs text-indigo-500 hover:text-indigo-600 transition-colors disabled:opacity-50"
               >
-                <Sparkles className="w-3 h-3" />
-                AI 재생성
+                {aiBusy ? <Loader2 className="w-3 h-3 animate-spin" /> : <Sparkles className="w-3 h-3" />}
+                {aiBusy ? 'AI 재생성 중...' : 'AI 재생성'}
               </button>
               {aiNotice && (
                 <div
                   className={cn(
                     'absolute right-0 top-6 z-10 w-56 text-[11px] leading-relaxed rounded-lg px-3 py-2 shadow-lg border',
-                    darkMode ? 'bg-neutral-800 border-neutral-700 text-neutral-300' : 'bg-white border-neutral-200 text-neutral-600'
+                    aiNotice.tone === 'error'
+                      ? 'border-rose-500/40 bg-rose-500/10 text-rose-500'
+                      : darkMode
+                      ? 'bg-neutral-800 border-neutral-700 text-neutral-300'
+                      : 'bg-white border-neutral-200 text-neutral-600'
                   )}
                 >
-                  AI 재생성은 로컬 LLM(LM Studio 등) 연동이 필요한 준비 중 기능입니다. 지금은 나레이션을 직접 수정해주세요.
+                  {aiNotice.text}
                 </div>
               )}
             </div>
@@ -1874,23 +2222,44 @@ function openPrintableStoryboard(projectName: string, scenes: Scene[]) {
 }
 
 function ExportModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => void }) {
-  const { scenes, currentProject, saveDirHandle, saveDirName, pushEditLog } = useStore();
+  const { scenes, currentProject, saveDirHandle, saveDirName, pushEditLog, ffmpegPathOverride, subtitleFontName } = useStore();
   const projectName = currentProject?.name ?? '스토리보드';
   const [pathNote, setPathNote] = useState(currentProject ? `${currentProject.folderPath}/export` : '');
   const [format, setFormat] = useState<'pdf' | 'json' | 'txt' | 'mp4'>('pdf');
   const [alsoSaveToFolder, setAlsoSaveToFolder] = useState(true);
+  const [resolution, setResolution] = useState<'1280x720' | '1920x1080'>('1280x720');
   const [isExporting, setIsExporting] = useState(false);
   const [done, setDone] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [errorDetail, setErrorDetail] = useState<string | null>(null);
+  const [progressLabel, setProgressLabel] = useState('');
+  const [ffmpegOk, setFfmpegOk] = useState<boolean | null>(null);
 
   const formats = [
     { id: 'pdf', label: 'PDF 스토리보드', desc: '브라우저 인쇄창으로 저장' },
     { id: 'json', label: 'JSON 프로젝트', desc: '원본 데이터 백업 (다운로드)' },
     { id: 'txt', label: '텍스트 스크립트', desc: '나레이션/대사만 (다운로드)' },
-    { id: 'mp4', label: 'MP4 영상 (예정)', desc: '자동 편집 영상 — 아직 지원되지 않음' },
+    { id: 'mp4', label: 'MP4 영상', desc: 'FFmpeg으로 자막을 입힌 영상 (SRT/TXT 자막 포함)' },
   ] as const;
 
   const safeName = projectName.replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, '_');
+
+  useEffect(() => {
+    if (format !== 'mp4') return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`/api/ffmpeg/check?ffmpegPath=${encodeURIComponent(ffmpegPathOverride || 'ffmpeg')}`);
+        const data = await res.json();
+        if (!cancelled) setFfmpegOk(Boolean(data.ok));
+      } catch {
+        if (!cancelled) setFfmpegOk(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [format, ffmpegPathOverride]);
 
   const writeExportToSaveFolder = async (fileName: string, content: string) => {
     if (!saveDirHandle) return;
@@ -1899,10 +2268,71 @@ function ExportModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => 
     await writeTextFile(exportsDir, fileName, content);
   };
 
+  const triggerDownload = (url: string) => {
+    const a = document.createElement('a');
+    a.href = url;
+    a.click();
+  };
+
+  const handleMp4Export = async () => {
+    const missing = scenes.filter((sc) => !sc.localVideoUrl && !sc.photoRef);
+    if (missing.length > 0) {
+      setErrorMsg(`${missing.length}개 장면에 사진/영상이 없습니다. 먼저 모든 장면에 이미지나 영상을 지정해주세요.`);
+      return;
+    }
+
+    setProgressLabel('이미지/영상 파일을 준비하는 중...');
+    const formData = new FormData();
+    const manifestScenes: { fileField: string; kind: 'image' | 'video'; duration: number }[] = [];
+
+    for (let i = 0; i < scenes.length; i++) {
+      const sc = scenes[i];
+      const kind: 'image' | 'video' = sc.localVideoUrl ? 'video' : 'image';
+      const src = kind === 'video' ? sc.localVideoUrl! : sc.photoRef;
+      const blob = await (await fetch(src)).blob();
+      const fileField = `file_${i}`;
+      const ext = kind === 'video' ? 'mp4' : blob.type.includes('png') ? 'png' : 'jpg';
+      formData.append(fileField, blob, `${fileField}.${ext}`);
+      manifestScenes.push({ fileField, kind, duration: sc.duration });
+    }
+
+    const [width, height] = resolution.split('x').map(Number);
+    const srtContent = buildSrt(scenes);
+    const txtContent = buildPlainTextScript(projectName, scenes);
+
+    const manifest = {
+      projectName: safeName,
+      width,
+      height,
+      fps: 30,
+      ffmpegPath: ffmpegPathOverride || undefined,
+      subtitleFontName: subtitleFontName || undefined,
+      scenes: manifestScenes,
+      srtContent,
+      txtContent,
+    };
+    formData.append('manifest', JSON.stringify(manifest));
+
+    setProgressLabel('FFmpeg으로 영상을 렌더링하는 중... (장면 수에 따라 시간이 걸릴 수 있습니다)');
+    const res = await fetch('/api/export/video', { method: 'POST', body: formData });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      throw Object.assign(new Error(data.error || '영상을 만드는 중 오류가 발생했습니다.'), {
+        detail: data.ffmpegStderr,
+      });
+    }
+
+    setProgressLabel('다운로드를 시작합니다...');
+    triggerDownload(`/api/export/video/${data.jobId}/${data.files.mp4}`);
+    setTimeout(() => triggerDownload(`/api/export/video/${data.jobId}/${data.files.srt}`), 400);
+    setTimeout(() => triggerDownload(`/api/export/video/${data.jobId}/${data.files.txt}`), 800);
+  };
+
   const handleExport = async () => {
-    if (isExporting || done || format === 'mp4') return;
+    if (isExporting || done) return;
     setIsExporting(true);
     setErrorMsg(null);
+    setErrorDetail(null);
     try {
       if (format === 'json') {
         const payload = {
@@ -1921,14 +2351,18 @@ function ExportModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => 
         if (alsoSaveToFolder && saveDirHandle) await writeExportToSaveFolder(fileName, text);
       } else if (format === 'pdf') {
         openPrintableStoryboard(projectName, scenes);
+      } else if (format === 'mp4') {
+        await handleMp4Export();
       }
       pushEditLog('export', `"${projectName}" ${format.toUpperCase()} 형식으로 내보내기`);
       setDone(true);
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
-      setErrorMsg('내보내는 중 문제가 발생했습니다.');
+      setErrorMsg(err?.message || '내보내는 중 문제가 발생했습니다.');
+      setErrorDetail(err?.detail);
     } finally {
       setIsExporting(false);
+      setProgressLabel('');
     }
   };
 
@@ -1936,8 +2370,8 @@ function ExportModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => 
 
   return (
     <ModalBackdrop onClose={onClose}>
-      <div className={cn('w-full max-w-lg rounded-2xl border shadow-2xl', modalBg)}>
-        <div className={cn('flex items-center justify-between px-6 py-4 border-b', darkMode ? 'border-neutral-800' : 'border-neutral-200')}>
+      <div className={cn('w-full max-w-lg rounded-2xl border shadow-2xl max-h-[85vh] flex flex-col', modalBg)}>
+        <div className={cn('shrink-0 flex items-center justify-between px-6 py-4 border-b', darkMode ? 'border-neutral-800' : 'border-neutral-200')}>
           <div className="flex items-center gap-2">
             <Download className="w-5 h-5 text-indigo-500" />
             <h2 className="font-bold text-base">내보내기</h2>
@@ -1947,7 +2381,7 @@ function ExportModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => 
           </button>
         </div>
 
-        <div className="p-6 space-y-5">
+        <div className="p-6 space-y-5 overflow-y-auto scrollbar-hide">
           {/* Format selection */}
           <div>
             <label className="text-xs font-semibold mb-2 block text-indigo-500">내보내기 형식</label>
@@ -1955,16 +2389,14 @@ function ExportModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => 
               {formats.map((f) => (
                 <button
                   key={f.id}
-                  onClick={() => f.id !== 'mp4' && setFormat(f.id as typeof format)}
-                  disabled={f.id === 'mp4'}
+                  onClick={() => { setFormat(f.id as typeof format); setDone(false); setErrorMsg(null); }}
                   className={cn(
                     'p-3 rounded-xl border text-left transition-all',
                     format === f.id
                       ? 'border-indigo-500 bg-indigo-50 dark:bg-indigo-500/10'
                       : darkMode
-                      ? 'border-neutral-800 hover:border-neutral-700 disabled:opacity-40'
-                      : 'border-neutral-200 hover:border-neutral-300 disabled:opacity-40',
-                    f.id === 'mp4' && 'cursor-not-allowed'
+                      ? 'border-neutral-800 hover:border-neutral-700'
+                      : 'border-neutral-200 hover:border-neutral-300'
                   )}
                 >
                   <p className="text-sm font-medium">{f.label}</p>
@@ -1973,6 +2405,44 @@ function ExportModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => 
               ))}
             </div>
           </div>
+
+          {format === 'mp4' && (
+            <div className="space-y-3">
+              {ffmpegOk === false && (
+                <div className="flex items-start gap-2 text-xs text-amber-500 bg-amber-500/10 rounded-lg px-3 py-2">
+                  <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                  <span>
+                    이 컴퓨터에서 FFmpeg을 찾지 못했습니다. FFmpeg을 설치해 PATH에 추가하거나, 헤더의 "설정"에서 FFmpeg 실행 파일 경로를 직접 지정해주세요. (설치 안내: ffmpeg.org/download.html)
+                  </span>
+                </div>
+              )}
+              <div>
+                <label className="text-xs font-semibold mb-1.5 block text-indigo-500">해상도</label>
+                <div className="flex gap-2">
+                  {(['1280x720', '1920x1080'] as const).map((r) => (
+                    <button
+                      key={r}
+                      onClick={() => setResolution(r)}
+                      className={cn(
+                        'flex-1 py-2 rounded-lg text-xs font-medium border transition-colors',
+                        resolution === r
+                          ? 'border-indigo-500 bg-indigo-50 dark:bg-indigo-500/10 text-indigo-600'
+                          : darkMode
+                          ? 'border-neutral-800 text-neutral-400'
+                          : 'border-neutral-200 text-neutral-500'
+                      )}
+                    >
+                      {r === '1280x720' ? '720p (빠름)' : '1080p (고화질)'}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <p className={cn('text-xs flex items-start gap-1.5', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>
+                <Info className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                자막(나레이션·대사)이 영상에 그대로 구워지며, 같은 내용의 SRT·TXT 자막 파일도 함께 다운로드됩니다.
+              </p>
+            </div>
+          )}
 
           {/* 저장 폴더에도 저장 */}
           {(format === 'json' || format === 'txt') && (
@@ -1999,25 +2469,27 @@ function ExportModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => 
           )}
 
           {/* 참고용 경로 메모 */}
-          <div>
-            <label className="text-xs font-semibold mb-1.5 block text-indigo-500">참고용 경로 메모</label>
-            <div className="relative">
-              <Folder className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-neutral-400" />
-              <input
-                type="text"
-                value={pathNote}
-                onChange={(e) => setPathNote(e.target.value)}
-                placeholder="예: /documents/KWJMvideoAI/export"
-                className={cn(
-                  'w-full pl-9 pr-3 py-2.5 text-sm rounded-lg border focus:outline-none focus:ring-2 focus:ring-indigo-500/40 font-mono',
-                  darkMode ? 'bg-neutral-800 border-neutral-700 text-neutral-100' : 'bg-neutral-50 border-neutral-200 text-neutral-900'
-                )}
-              />
+          {format !== 'mp4' && (
+            <div>
+              <label className="text-xs font-semibold mb-1.5 block text-indigo-500">참고용 경로 메모</label>
+              <div className="relative">
+                <Folder className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-neutral-400" />
+                <input
+                  type="text"
+                  value={pathNote}
+                  onChange={(e) => setPathNote(e.target.value)}
+                  placeholder="예: /documents/KWJMvideoAI/export"
+                  className={cn(
+                    'w-full pl-9 pr-3 py-2.5 text-sm rounded-lg border focus:outline-none focus:ring-2 focus:ring-indigo-500/40 font-mono',
+                    darkMode ? 'bg-neutral-800 border-neutral-700 text-neutral-100' : 'bg-neutral-50 border-neutral-200 text-neutral-900'
+                  )}
+                />
+              </div>
+              <p className={cn('text-xs mt-1', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>
+                실제 다운로드 위치는 브라우저의 기본 다운로드 폴더를 따릅니다. 이 메모는 정리용 참고 텍스트일 뿐입니다.
+              </p>
             </div>
-            <p className={cn('text-xs mt-1', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>
-              실제 다운로드 위치는 브라우저의 기본 다운로드 폴더를 따릅니다. 이 메모는 정리용 참고 텍스트일 뿐입니다.
-            </p>
-          </div>
+          )}
 
           {/* Summary */}
           <div className={cn('rounded-xl p-4', darkMode ? 'bg-neutral-800/60' : 'bg-neutral-50 border border-neutral-200')}>
@@ -2025,26 +2497,38 @@ function ExportModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => 
             <div className="space-y-1.5">
               <SummaryRow label="프로젝트" value={projectName} darkMode={darkMode} />
               <SummaryRow label="장면 수" value={`${scenes.length}개`} darkMode={darkMode} />
-              <SummaryRow label="총 재생시간" value={`${scenes.reduce((s, sc) => s + sc.duration, 0)}초`} darkMode={darkMode} />
+              <SummaryRow label="총 재생시간" value={`${totalDuration(scenes).toFixed(0)}초`} darkMode={darkMode} />
               <SummaryRow label="형식" value={format.toUpperCase()} darkMode={darkMode} />
             </div>
           </div>
 
+          {isExporting && progressLabel && (
+            <div className="flex items-center gap-2 text-xs text-indigo-500 bg-indigo-500/10 rounded-lg px-3 py-2">
+              <Loader2 className="w-3.5 h-3.5 shrink-0 animate-spin" />
+              <span>{progressLabel}</span>
+            </div>
+          )}
+
           {errorMsg && (
-            <div className="flex items-start gap-2 text-xs text-rose-500 bg-rose-500/10 rounded-lg px-3 py-2">
-              <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
-              <span>{errorMsg}</span>
+            <div className="text-xs text-rose-500 bg-rose-500/10 rounded-lg px-3 py-2 space-y-1">
+              <div className="flex items-start gap-2">
+                <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                <span>{errorMsg}</span>
+              </div>
+              {errorDetail && (
+                <pre className="text-[10px] whitespace-pre-wrap opacity-70 max-h-24 overflow-y-auto">{errorDetail}</pre>
+              )}
             </div>
           )}
         </div>
 
-        <div className={cn('px-6 py-4 border-t flex justify-end gap-2', darkMode ? 'border-neutral-800' : 'border-neutral-200')}>
+        <div className={cn('shrink-0 px-6 py-4 border-t flex justify-end gap-2', darkMode ? 'border-neutral-800' : 'border-neutral-200')}>
           <button onClick={onClose} className={cn('px-4 py-2 text-sm rounded-lg transition-colors', darkMode ? 'hover:bg-neutral-800 text-neutral-400' : 'hover:bg-neutral-100 text-neutral-500')}>
             취소
           </button>
           <button
             onClick={handleExport}
-            disabled={isExporting || format === 'mp4'}
+            disabled={isExporting}
             className={cn(
               'px-5 py-2 text-sm rounded-lg font-medium transition-all flex items-center gap-1.5',
               done
@@ -2087,6 +2571,384 @@ function SummaryRow({
         {value}
       </span>
     </div>
+  );
+}
+
+// ─── Settings Modal (LM Studio / FFmpeg) ──────────────────────────────────────
+
+function SettingsModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => void }) {
+  const {
+    llmBaseUrl,
+    setLlmBaseUrl,
+    llmModel,
+    setLlmModel,
+    llmAvailableModels,
+    ffmpegPathOverride,
+    setFfmpegPathOverride,
+    subtitleFontName,
+    setSubtitleFontName,
+  } = useStore();
+
+  const [baseUrlDraft, setBaseUrlDraft] = useState(llmBaseUrl);
+  const [modelDraft, setModelDraft] = useState(llmModel);
+  const [ffmpegDraft, setFfmpegDraft] = useState(ffmpegPathOverride);
+  const [fontDraft, setFontDraft] = useState(subtitleFontName);
+
+  const [llmCheck, setLlmCheck] = useState<{ busy: boolean; ok: boolean | null; message: string; models: string[] }>({
+    busy: false,
+    ok: null,
+    message: '',
+    models: llmAvailableModels,
+  });
+  const [ffmpegCheck, setFfmpegCheck] = useState<{ busy: boolean; ok: boolean | null; message: string }>({
+    busy: false,
+    ok: null,
+    message: '',
+  });
+
+  const handleCheckLlm = async () => {
+    setLlmCheck((s) => ({ ...s, busy: true }));
+    const health = await checkLlmHealth(baseUrlDraft);
+    setLlmCheck({
+      busy: false,
+      ok: health.ok,
+      message: health.ok ? `연결 성공! 로드된 모델 ${health.models.length}개` : health.error ?? '연결 실패',
+      models: health.models,
+    });
+  };
+
+  const handleCheckFfmpeg = async () => {
+    setFfmpegCheck((s) => ({ ...s, busy: true }));
+    try {
+      const res = await fetch(`/api/ffmpeg/check?ffmpegPath=${encodeURIComponent(ffmpegDraft || 'ffmpeg')}`);
+      const data = await res.json();
+      setFfmpegCheck({ busy: false, ok: Boolean(data.ok), message: data.ok ? data.version : data.error });
+    } catch (err: any) {
+      setFfmpegCheck({ busy: false, ok: false, message: err?.message ?? 'FFmpeg 확인 중 오류' });
+    }
+  };
+
+  const handleSave = () => {
+    setLlmBaseUrl(baseUrlDraft.trim() || 'http://localhost:1234/v1');
+    setLlmModel(modelDraft.trim());
+    setFfmpegPathOverride(ffmpegDraft.trim());
+    setSubtitleFontName(fontDraft.trim());
+    onClose();
+  };
+
+  const modalBg = darkMode ? 'bg-neutral-900 border-neutral-800' : 'bg-white border-neutral-200';
+  const inputCls = cn(
+    'w-full px-3 py-2 text-sm rounded-lg border focus:outline-none focus:ring-2 focus:ring-indigo-500/40 font-mono',
+    darkMode ? 'bg-neutral-800 border-neutral-700 text-neutral-100' : 'bg-neutral-50 border-neutral-200 text-neutral-900'
+  );
+
+  return (
+    <ModalBackdrop onClose={onClose}>
+      <div className={cn('w-full max-w-lg rounded-2xl border shadow-2xl max-h-[85vh] flex flex-col', modalBg)}>
+        <div className={cn('shrink-0 flex items-center justify-between px-6 py-4 border-b', darkMode ? 'border-neutral-800' : 'border-neutral-200')}>
+          <div className="flex items-center gap-2">
+            <Settings className="w-5 h-5 text-indigo-500" />
+            <h2 className="font-bold text-base">설정</h2>
+          </div>
+          <button onClick={onClose} className={cn('w-7 h-7 flex items-center justify-center rounded-lg', darkMode ? 'hover:bg-neutral-800' : 'hover:bg-neutral-100')}>
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        <div className="p-6 space-y-6 overflow-y-auto scrollbar-hide">
+          {/* LM Studio */}
+          <div className="space-y-2.5">
+            <h3 className="text-xs font-semibold uppercase tracking-widest text-indigo-500">LM Studio (LLM)</h3>
+            <div>
+              <label className="text-xs mb-1 block text-neutral-500">서버 주소</label>
+              <input value={baseUrlDraft} onChange={(e) => setBaseUrlDraft(e.target.value)} placeholder="http://localhost:1234/v1" className={inputCls} />
+            </div>
+            <div>
+              <label className="text-xs mb-1 block text-neutral-500">모델 ID (LM Studio에 로드된 모델과 정확히 일치해야 합니다)</label>
+              <input value={modelDraft} onChange={(e) => setModelDraft(e.target.value)} placeholder="qwen3.5-9b" className={inputCls} />
+              {llmCheck.models.length > 0 && (
+                <div className="flex flex-wrap gap-1.5 mt-1.5">
+                  {llmCheck.models.map((m) => (
+                    <button
+                      key={m}
+                      onClick={() => setModelDraft(m)}
+                      className={cn(
+                        'text-[11px] px-2 py-1 rounded-md font-mono border transition-colors',
+                        m === modelDraft
+                          ? 'border-indigo-500 text-indigo-500'
+                          : darkMode
+                          ? 'border-neutral-700 text-neutral-400 hover:border-neutral-600'
+                          : 'border-neutral-200 text-neutral-500 hover:border-neutral-300'
+                      )}
+                    >
+                      {m}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={handleCheckLlm}
+                disabled={llmCheck.busy}
+                className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-medium transition-colors"
+              >
+                {llmCheck.busy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+                연결 확인
+              </button>
+              {llmCheck.ok !== null && (
+                <span className={cn('text-xs', llmCheck.ok ? 'text-emerald-500' : 'text-rose-500')}>{llmCheck.message}</span>
+              )}
+            </div>
+            <p className={cn('text-[11px] leading-relaxed', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>
+              LM Studio 앱을 열고 좌측 "Local Server" 탭에서 모델을 로드한 뒤 서버를 시작해야 합니다. 이 앱은 오직 LM Studio(로컬)만 사용하며 다른 원격 AI는 호출하지 않습니다.
+            </p>
+          </div>
+
+          <div className={cn('h-px', darkMode ? 'bg-neutral-800' : 'bg-neutral-200')} />
+
+          {/* FFmpeg */}
+          <div className="space-y-2.5">
+            <h3 className="text-xs font-semibold uppercase tracking-widest text-indigo-500">FFmpeg (MP4 내보내기)</h3>
+            <div>
+              <label className="text-xs mb-1 block text-neutral-500">FFmpeg 실행 파일 경로 (비워두면 시스템 PATH의 ffmpeg 사용)</label>
+              <input value={ffmpegDraft} onChange={(e) => setFfmpegDraft(e.target.value)} placeholder="예: C:\ffmpeg\bin\ffmpeg.exe" className={inputCls} />
+            </div>
+            <div>
+              <label className="text-xs mb-1 block text-neutral-500">자막 폰트 이름 (선택, 비워두면 시스템 기본 폰트)</label>
+              <input value={fontDraft} onChange={(e) => setFontDraft(e.target.value)} placeholder="예: Malgun Gothic" className={inputCls} />
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={handleCheckFfmpeg}
+                disabled={ffmpegCheck.busy}
+                className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-neutral-700 hover:bg-neutral-600 disabled:opacity-50 text-white font-medium transition-colors"
+              >
+                {ffmpegCheck.busy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+                FFmpeg 확인
+              </button>
+              {ffmpegCheck.ok !== null && (
+                <span className={cn('text-xs truncate', ffmpegCheck.ok ? 'text-emerald-500' : 'text-rose-500')}>{ffmpegCheck.message}</span>
+              )}
+            </div>
+          </div>
+        </div>
+
+        <div className={cn('shrink-0 px-6 py-4 border-t flex justify-end gap-2', darkMode ? 'border-neutral-800' : 'border-neutral-200')}>
+          <button onClick={onClose} className={cn('px-4 py-2 text-sm rounded-lg transition-colors', darkMode ? 'hover:bg-neutral-800 text-neutral-400' : 'hover:bg-neutral-100 text-neutral-500')}>
+            취소
+          </button>
+          <button onClick={handleSave} className="px-5 py-2 text-sm rounded-lg font-medium bg-indigo-600 hover:bg-indigo-700 text-white flex items-center gap-1.5">
+            <Check className="w-4 h-4" /> 저장
+          </button>
+        </div>
+      </div>
+    </ModalBackdrop>
+  );
+}
+
+// ─── Blog Import Modal (블로그 데이터 폴더에서 글/사진 가져오기) ────────────────────
+
+function BlogImportModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => void }) {
+  const {
+    blogDirHandle,
+    blogDirName,
+    blogPosts,
+    blogMedia,
+    blogSelectedPostIds,
+    setBlogSelectedPostIds,
+    connectBlogDataFolder,
+    disconnectBlogDataFolder,
+    addChatMessage,
+  } = useStore();
+
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState<{ tone: 'ok' | 'error'; text: string } | null>(null);
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo] = useState('');
+  const [checked, setChecked] = useState<Set<string>>(new Set(blogSelectedPostIds));
+  const [previewUrls, setPreviewUrls] = useState<Record<string, string>>({});
+
+  const filteredPosts = filterPostsByDateRange(blogPosts, dateFrom || undefined, dateTo || undefined).sort(
+    (a, b) => (a.createdAt < b.createdAt ? 1 : -1)
+  );
+
+  useEffect(() => {
+    if (!blogDirHandle) return;
+    let cancelled = false;
+    (async () => {
+      const entries = await Promise.all(
+        filteredPosts.slice(0, 24).map(async (p) => {
+          const firstMedia = blogMedia.find((m) => m.postId === p.id);
+          if (!firstMedia) return [p.id, ''] as const;
+          const url = await blogMediaPreviewUrl(blogDirHandle, firstMedia);
+          return [p.id, url ?? ''] as const;
+        })
+      );
+      if (!cancelled) setPreviewUrls(Object.fromEntries(entries));
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [blogDirHandle, blogPosts.length, dateFrom, dateTo]);
+
+  const handleConnect = async () => {
+    setBusy(true);
+    setNotice(null);
+    const res = await connectBlogDataFolder();
+    setBusy(false);
+    setNotice({ tone: res.ok ? 'ok' : 'error', text: res.message ?? '' });
+  };
+
+  const toggle = (id: string) => {
+    setChecked((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const handleApply = () => {
+    const ids = Array.from(checked);
+    setBlogSelectedPostIds(ids);
+    const posts = blogPosts.filter((p) => ids.includes(p.id));
+    if (posts.length > 0) {
+      const summary = posts
+        .map((p) => `- "${p.title}" (${p.createdAt.slice(0, 10)}${p.location ? `, ${p.location}` : ''})`)
+        .join('\n');
+      addChatMessage(
+        'user',
+        `다음 블로그 글을 참고해서 영상을 만들어줘:\n${summary}`
+      );
+    }
+    onClose();
+  };
+
+  const modalBg = darkMode ? 'bg-neutral-900 border-neutral-800' : 'bg-white border-neutral-200';
+
+  return (
+    <ModalBackdrop onClose={onClose}>
+      <div className={cn('w-full max-w-2xl rounded-2xl border shadow-2xl max-h-[85vh] flex flex-col', modalBg)}>
+        <div className={cn('shrink-0 flex items-center justify-between px-6 py-4 border-b', darkMode ? 'border-neutral-800' : 'border-neutral-200')}>
+          <div className="flex items-center gap-2">
+            <Newspaper className="w-5 h-5 text-sky-500" />
+            <h2 className="font-bold text-base">블로그에서 가져오기</h2>
+          </div>
+          <button onClick={onClose} className={cn('w-7 h-7 flex items-center justify-center rounded-lg', darkMode ? 'hover:bg-neutral-800' : 'hover:bg-neutral-100')}>
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        <div className="p-6 space-y-4 overflow-y-auto scrollbar-hide flex-1 min-h-0">
+          {!blogDirHandle ? (
+            <div className="text-center py-8 space-y-3">
+              <Newspaper className={cn('w-10 h-10 mx-auto', darkMode ? 'text-neutral-700' : 'text-neutral-300')} />
+              <p className={cn('text-sm', darkMode ? 'text-neutral-400' : 'text-neutral-500')}>
+                블로그가 데이터를 저장하는 폴더(posts.json, media-meta.json, uploads/가 있는 폴더)를 연결해주세요.
+              </p>
+              <button
+                onClick={handleConnect}
+                disabled={busy}
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-sky-600 hover:bg-sky-700 disabled:opacity-50 text-white text-sm font-medium transition-colors"
+              >
+                {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Link2 className="w-4 h-4" />}
+                블로그 데이터 폴더 연결
+              </button>
+              {notice && (
+                <p className={cn('text-xs', notice.tone === 'ok' ? 'text-emerald-500' : 'text-rose-500')}>{notice.text}</p>
+              )}
+            </div>
+          ) : (
+            <>
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-1.5 text-xs">
+                  <FolderCheck className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
+                  <span className="font-medium">"{blogDirName}" · 글 {blogPosts.length}개 · 미디어 {blogMedia.length}개</span>
+                </div>
+                <button onClick={disconnectBlogDataFolder} className="text-xs text-neutral-400 hover:text-neutral-600 flex items-center gap-1">
+                  <Link2Off className="w-3.5 h-3.5" /> 연결 해제
+                </button>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} className={cn('px-2.5 py-1.5 text-xs rounded-lg border', darkMode ? 'bg-neutral-800 border-neutral-700' : 'bg-neutral-50 border-neutral-200')} />
+                <span className="text-xs text-neutral-400">~</span>
+                <input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} className={cn('px-2.5 py-1.5 text-xs rounded-lg border', darkMode ? 'bg-neutral-800 border-neutral-700' : 'bg-neutral-50 border-neutral-200')} />
+                <span className={cn('text-xs ml-auto', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>{checked.size}개 선택됨</span>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2.5">
+                {filteredPosts.length === 0 && (
+                  <p className={cn('col-span-2 text-xs text-center py-8', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>
+                    조건에 맞는 글이 없습니다.
+                  </p>
+                )}
+                {filteredPosts.map((post) => {
+                  const isChecked = checked.has(post.id);
+                  const preview = previewUrls[post.id];
+                  const mediaCount = blogMedia.filter((m) => m.postId === post.id).length;
+                  return (
+                    <button
+                      key={post.id}
+                      onClick={() => toggle(post.id)}
+                      className={cn(
+                        'text-left rounded-xl border p-2.5 flex gap-2.5 transition-all',
+                        isChecked
+                          ? 'border-sky-500 bg-sky-50 dark:bg-sky-500/10'
+                          : darkMode
+                          ? 'border-neutral-800 hover:border-neutral-700'
+                          : 'border-neutral-200 hover:border-neutral-300'
+                      )}
+                    >
+                      <div className={cn('w-14 h-14 rounded-lg shrink-0 overflow-hidden flex items-center justify-center', darkMode ? 'bg-neutral-800' : 'bg-neutral-100')}>
+                        {preview ? (
+                          <img src={preview} alt={post.title} className="w-full h-full object-cover" />
+                        ) : (
+                          <ImageIcon className="w-4 h-4 text-neutral-400" />
+                        )}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-1.5">
+                          <span
+                            className={cn(
+                              'w-4 h-4 rounded border shrink-0 flex items-center justify-center',
+                              isChecked ? 'bg-sky-500 border-sky-500' : darkMode ? 'border-neutral-600' : 'border-neutral-300'
+                            )}
+                          >
+                            {isChecked && <Check className="w-3 h-3 text-white" />}
+                          </span>
+                          <p className="text-xs font-medium truncate">{post.title}</p>
+                        </div>
+                        <p className={cn('text-[11px] mt-0.5 truncate', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>
+                          {post.createdAt.slice(0, 10)}{post.location ? ` · ${post.location}` : ''} · 사진/영상 {mediaCount}개
+                        </p>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </>
+          )}
+        </div>
+
+        {blogDirHandle && (
+          <div className={cn('shrink-0 px-6 py-4 border-t flex justify-end gap-2', darkMode ? 'border-neutral-800' : 'border-neutral-200')}>
+            <button onClick={onClose} className={cn('px-4 py-2 text-sm rounded-lg transition-colors', darkMode ? 'hover:bg-neutral-800 text-neutral-400' : 'hover:bg-neutral-100 text-neutral-500')}>
+              취소
+            </button>
+            <button
+              onClick={handleApply}
+              disabled={checked.size === 0}
+              className="px-5 py-2 text-sm rounded-lg font-medium bg-sky-600 hover:bg-sky-700 disabled:opacity-50 text-white flex items-center gap-1.5"
+            >
+              <Check className="w-4 h-4" /> 선택한 글 {checked.size}개 가져오기
+            </button>
+          </div>
+        )}
+      </div>
+    </ModalBackdrop>
   );
 }
 

@@ -12,8 +12,8 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="ko">
-      <body>{children}</body>
+    <html lang="ko" className="h-full overflow-hidden">
+      <body className="h-full overflow-hidden">{children}</body>
     </html>
   );
 }

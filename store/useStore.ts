@@ -16,6 +16,7 @@ import {
   fileHandleToObjectUrl,
   type MediaFileEntry,
 } from '@/lib/fsAccess';
+import { readBlogData, type BlogPost, type BlogMediaMeta, type BlogCategory } from '@/lib/blogData';
 
 export interface Scene {
   id: string;
@@ -32,6 +33,9 @@ export interface Scene {
   localVideoName?: string;
   /** 로컬 영상 미리보기용 objectURL (세션 동안만 유효 — 저장 파일에는 기록되지 않습니다) */
   localVideoUrl?: string;
+  /** 블로그 데이터에서 가져온 장면이면 원본 글/미디어 id (추적용, 선택 항목) */
+  sourcePostId?: string;
+  sourceMediaId?: string;
 }
 
 export interface Project {
@@ -45,7 +49,9 @@ export interface Project {
 }
 
 export type ViewState = 'chat' | 'editor';
-export type ModalState = null | 'new-project' | 'load' | 'export' | 'media';
+export type ModalState = null | 'new-project' | 'load' | 'export' | 'media' | 'settings' | 'blog-import';
+
+export type LlmStatus = 'unknown' | 'checking' | 'online' | 'offline';
 
 export interface ChatMessage {
   id: string;
@@ -247,6 +253,33 @@ interface AppState {
   connectMediaFolder: () => Promise<{ ok: boolean; message?: string }>;
   disconnectMediaFolder: () => void;
   resyncMediaReferences: () => Promise<void>;
+
+  // ── 블로그 데이터 폴더 (posts.json / media-meta.json / uploads) ──────────
+  blogDirHandle: any | null;
+  blogDirName: string | null;
+  blogPosts: BlogPost[];
+  blogMedia: BlogMediaMeta[];
+  blogCategories: BlogCategory[];
+  connectBlogDataFolder: () => Promise<{ ok: boolean; message?: string }>;
+  disconnectBlogDataFolder: () => void;
+  /** 블로그 가져오기 모달에서 선택한 글 id들 — 채팅에 첨부되어 스토리보드 생성 시 미디어 후보로 사용됩니다. */
+  blogSelectedPostIds: string[];
+  setBlogSelectedPostIds: (ids: string[]) => void;
+
+  // ── LM Studio / FFmpeg 설정 ────────────────────────────────────────────
+  llmBaseUrl: string;
+  setLlmBaseUrl: (v: string) => void;
+  llmModel: string;
+  setLlmModel: (v: string) => void;
+  llmStatus: LlmStatus;
+  setLlmStatus: (v: LlmStatus) => void;
+  llmAvailableModels: string[];
+  setLlmAvailableModels: (v: string[]) => void;
+
+  ffmpegPathOverride: string;
+  setFfmpegPathOverride: (v: string) => void;
+  subtitleFontName: string;
+  setSubtitleFontName: (v: string) => void;
 }
 
 export const useStore = create<AppState>((set, get) => {
@@ -408,6 +441,10 @@ export const useStore = create<AppState>((set, get) => {
             scenes: appState.scenes,
             darkMode: typeof appState.darkMode === 'boolean' ? appState.darkMode : get().darkMode,
             selectedSceneId: appState.selectedSceneId ?? appState.scenes[0]?.id ?? null,
+            llmBaseUrl: typeof appState.llmBaseUrl === 'string' && appState.llmBaseUrl ? appState.llmBaseUrl : get().llmBaseUrl,
+            llmModel: typeof appState.llmModel === 'string' && appState.llmModel ? appState.llmModel : get().llmModel,
+            ffmpegPathOverride: typeof appState.ffmpegPathOverride === 'string' ? appState.ffmpegPathOverride : get().ffmpegPathOverride,
+            subtitleFontName: typeof appState.subtitleFontName === 'string' ? appState.subtitleFontName : get().subtitleFontName,
           });
           if (appState.currentProjectMeta) {
             set((s) => ({
@@ -479,6 +516,10 @@ export const useStore = create<AppState>((set, get) => {
               }
             : null,
           mediaDirName: state.mediaDirName,
+          llmBaseUrl: state.llmBaseUrl,
+          llmModel: state.llmModel,
+          ffmpegPathOverride: state.ffmpegPathOverride,
+          subtitleFontName: state.subtitleFontName,
         };
         const chatPayload = { version: 1, updatedAt: now, messages: state.chatMessages };
         const logPayload = { version: 1, updatedAt: now, entries: state.editLog.slice(-MAX_LOG_ENTRIES) };
@@ -636,6 +677,84 @@ export const useStore = create<AppState>((set, get) => {
         })
       );
       set({ scenes: updated });
+    },
+
+    // ── 블로그 데이터 폴더 ────────────────────────────────────────────────
+    blogDirHandle: null,
+    blogDirName: null,
+    blogPosts: [],
+    blogMedia: [],
+    blogCategories: [],
+    connectBlogDataFolder: async () => {
+      const handle = await pickDirectory('read');
+      if (!handle) return { ok: false, message: '폴더 선택이 취소되었습니다.' };
+      const granted = await verifyPermission(handle, 'read');
+      if (!granted) return { ok: false, message: '폴더 읽기 권한이 거부되었습니다.' };
+      try {
+        const data = await readBlogData(handle);
+        if (data.posts.length === 0) {
+          return {
+            ok: false,
+            message: `"${handle.name}" 폴더에서 posts.json을 찾지 못했습니다. 블로그가 데이터를 저장하는 폴더(data 폴더)를 선택했는지 확인해주세요.`,
+          };
+        }
+        set({
+          blogDirHandle: handle,
+          blogDirName: handle.name,
+          blogPosts: data.posts,
+          blogMedia: data.media,
+          blogCategories: data.categories,
+        });
+        addLogEntry('blog_connect', `블로그 데이터 폴더 연결됨: "${handle.name}" (글 ${data.posts.length}개)`);
+        return {
+          ok: true,
+          message: data.hasMediaMeta
+            ? `블로그 글 ${data.posts.length}개, 미디어 ${data.media.length}개를 불러왔습니다.`
+            : `블로그 글 ${data.posts.length}개를 불러왔습니다. (media-meta.json이 없어 사진/영상 매칭은 되지 않습니다)`,
+        };
+      } catch (err) {
+        console.error(err);
+        return { ok: false, message: '블로그 데이터를 읽는 중 문제가 발생했습니다.' };
+      }
+    },
+    disconnectBlogDataFolder: () => {
+      set({
+        blogDirHandle: null,
+        blogDirName: null,
+        blogPosts: [],
+        blogMedia: [],
+        blogCategories: [],
+        blogSelectedPostIds: [],
+      });
+    },
+    blogSelectedPostIds: [],
+    setBlogSelectedPostIds: (ids) => set({ blogSelectedPostIds: ids }),
+
+    // ── LM Studio / FFmpeg 설정 ────────────────────────────────────────────
+    llmBaseUrl: 'http://localhost:1234/v1',
+    setLlmBaseUrl: (v) => {
+      set({ llmBaseUrl: v, llmStatus: 'unknown' });
+      scheduleAutosave();
+    },
+    llmModel: 'qwen3.5-9b',
+    setLlmModel: (v) => {
+      set({ llmModel: v });
+      scheduleAutosave();
+    },
+    llmStatus: 'unknown',
+    setLlmStatus: (v) => set({ llmStatus: v }),
+    llmAvailableModels: [],
+    setLlmAvailableModels: (v) => set({ llmAvailableModels: v }),
+
+    ffmpegPathOverride: '',
+    setFfmpegPathOverride: (v) => {
+      set({ ffmpegPathOverride: v });
+      scheduleAutosave();
+    },
+    subtitleFontName: '',
+    setSubtitleFontName: (v) => {
+      set({ subtitleFontName: v });
+      scheduleAutosave();
     },
   };
 });
