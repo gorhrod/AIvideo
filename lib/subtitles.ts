@@ -92,3 +92,37 @@ export function buildPlainTextScript(projectName: string, scenes: SubtitleScene[
 export function totalDuration(scenes: SubtitleScene[]): number {
   return scenes.reduce((sum, s) => sum + Math.max(0.1, s.duration || 0), 0);
 }
+
+// ─── 자막 가독 시간 추정 ──────────────────────────────────────────────────────
+//
+// AI가 스토리보드를 새로 만들 때, LLM이 제시하는 duration은 종종 나레이션 길이와
+// 무관하게 대충 정해집니다(예: 긴 나레이션인데 duration=3). 그러면 자막이 화면에서
+// 채 다 읽히기도 전에 다음 장면으로 넘어가버립니다. 이를 방지하기 위해 나레이션+대사
+// 글자 수 기준으로 "최소 재생시간"을 추정하고, LLM이 준 duration과 비교해 더 큰 값을
+// 사용합니다 (짧게 지정된 것만 늘리고, 사용자가 이미 충분히 길게 잡은 값은 건드리지 않음).
+
+/** 한국어 자막 기준 대략적인 초당 읽기 글자 수 (평균적인 시청 속도 가정). */
+const READING_CHARS_PER_SECOND = 6.5;
+const MIN_SCENE_SECONDS = 2;
+const MAX_AUTO_SCENE_SECONDS = 20;
+
+/** 나레이션+대사 텍스트 길이로부터 자막을 편안히 읽을 수 있는 최소 재생시간(초)을 추정합니다. */
+export function estimateReadingDurationSeconds(narration: string, dialogue?: string): number {
+  const text = `${narration ?? ''} ${dialogue ?? ''}`.trim();
+  if (!text) return MIN_SCENE_SECONDS;
+  // 공백을 제외한 글자 수 기준으로 계산 (한글/영문 혼용 대본에서 대략적인 근사치로 충분합니다).
+  const charCount = text.replace(/\s+/g, '').length;
+  const estimated = charCount / READING_CHARS_PER_SECOND + 0.6; // 시작 여유시간
+  return Math.min(MAX_AUTO_SCENE_SECONDS, Math.max(MIN_SCENE_SECONDS, Math.round(estimated)));
+}
+
+/**
+ * LLM이 제시한 duration과 자막 읽기 시간 추정치 중 더 큰 값을 사용해, 새로 생성되는
+ * 장면의 재생시간을 보정합니다. 이미 충분히 긴 duration은 그대로 두고, 자막이 잘릴 만큼
+ * 짧은 경우에만 늘립니다.
+ */
+export function ensureReadableDuration(duration: number, narration: string, dialogue?: string): number {
+  const minReadable = estimateReadingDurationSeconds(narration, dialogue);
+  const safeDuration = Number.isFinite(duration) && duration > 0 ? duration : minReadable;
+  return Math.min(MAX_AUTO_SCENE_SECONDS, Math.max(safeDuration, minReadable));
+}

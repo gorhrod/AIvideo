@@ -188,3 +188,114 @@ export async function fileHandleToObjectUrl(fileHandle: any): Promise<string> {
   const file = await fileHandle.getFile();
   return URL.createObjectURL(file);
 }
+
+// ─── 저장 폴더 자동 설정 (2026-07-25 추가) ────────────────────────────────────
+//
+// 요청사항: "저장 폴더가 없으면 새로 만들어서 자동저장, 마지막에 연결한 저장 폴더 위치를
+// 기억해서 다음에 열 때 그 위치를 그대로 사용". File System Access API의 폴더 선택창은
+// 항상 사용자 제스처(클릭)가 있어야만 열 수 있어 완전히 조용히 "새 폴더를 만들어 연결"할
+// 수는 없습니다. 대신 두 단계로 이 요구를 충족합니다:
+//  1) 브라우저의 OPFS(Origin Private File System, navigator.storage.getDirectory())를
+//     기본 저장 폴더로 자동 사용합니다 — 사용자 다이얼로그 없이 항상 사용 가능하고
+//     브라우저에 자동으로 남아있습니다. 이 핸들도 일반 FileSystemDirectoryHandle이라
+//     이 파일의 다른 함수들(writeJsonFile 등)을 그대로 사용할 수 있습니다.
+//  2) 사용자가 명시적으로 "저장 폴더 연결"로 실제 폴더를 고르면, 그 폴더 핸들을
+//     IndexedDB에 남겨두고 다음 방문 시 자동으로 재연결을 시도합니다(권한이 이미
+//     허용되어 있으면 다이얼로그 없이, 아니면 사용자가 한 번 클릭해 재연결할 수 있게 안내).
+//     (참고: 이건 채팅/씬 등 실제 콘텐츠 데이터가 아니라 "어느 폴더였는지"를 가리키는
+//     핸들 참조만 남기는 것이라, 콘텐츠는 항상 실제 파일에만 저장한다는 원칙과 배치되지
+//     않습니다.)
+
+const HANDLE_DB_NAME = 'kwjmvideoai_handles';
+const HANDLE_STORE_NAME = 'handles';
+export const REMEMBERED_SAVE_DIR_KEY = 'saveDirHandle';
+
+/** OPFS 루트 핸들을 가져옵니다 (지원하지 않는 브라우저면 null). 사용자 권한 다이얼로그가 필요 없습니다. */
+export async function getOpfsRoot(): Promise<any | null> {
+  try {
+    if (typeof navigator === 'undefined' || !(navigator as any).storage?.getDirectory) return null;
+    return await (navigator as any).storage.getDirectory();
+  } catch {
+    return null;
+  }
+}
+
+function openHandleDb(): Promise<IDBDatabase | null> {
+  return new Promise((resolve) => {
+    if (typeof indexedDB === 'undefined') {
+      resolve(null);
+      return;
+    }
+    try {
+      const req = indexedDB.open(HANDLE_DB_NAME, 1);
+      req.onupgradeneeded = () => {
+        if (!req.result.objectStoreNames.contains(HANDLE_STORE_NAME)) {
+          req.result.createObjectStore(HANDLE_STORE_NAME);
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+/** 사용자가 명시적으로 연결한 저장 폴더의 핸들을 기억해둡니다 (다음 방문 시 자동 재연결용). */
+export async function rememberDirectoryHandle(key: string, handle: any): Promise<void> {
+  const db = await openHandleDb();
+  if (!db) return;
+  await new Promise<void>((resolve) => {
+    try {
+      const tx = db.transaction(HANDLE_STORE_NAME, 'readwrite');
+      tx.objectStore(HANDLE_STORE_NAME).put(handle, key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    } catch {
+      resolve();
+    }
+  });
+}
+
+/** 기억해둔 폴더 핸들을 가져옵니다 (없으면 null). */
+export async function getRememberedDirectoryHandle(key: string): Promise<any | null> {
+  const db = await openHandleDb();
+  if (!db) return null;
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(HANDLE_STORE_NAME, 'readonly');
+      const req = tx.objectStore(HANDLE_STORE_NAME).get(key);
+      req.onsuccess = () => resolve(req.result ?? null);
+      req.onerror = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+/** 기억해둔 폴더 핸들을 지웁니다. */
+export async function forgetRememberedDirectoryHandle(key: string): Promise<void> {
+  const db = await openHandleDb();
+  if (!db) return;
+  await new Promise<void>((resolve) => {
+    try {
+      const tx = db.transaction(HANDLE_STORE_NAME, 'readwrite');
+      tx.objectStore(HANDLE_STORE_NAME).delete(key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    } catch {
+      resolve();
+    }
+  });
+}
+
+/** 사용자 제스처(클릭) 없이 조용히 권한 상태만 확인합니다 (requestPermission과 달리 다이얼로그를 띄우지 않음). */
+export async function queryPermissionSilently(handle: any, mode: 'read' | 'readwrite' = 'readwrite'): Promise<boolean> {
+  if (!handle) return false;
+  if (typeof handle.queryPermission !== 'function') return true; // OPFS 등 권한 API가 없으면 통과
+  try {
+    return (await handle.queryPermission({ mode })) === 'granted';
+  } catch {
+    return false;
+  }
+}

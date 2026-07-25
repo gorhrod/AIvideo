@@ -3,19 +3,27 @@
 // 흐름:
 //  1) 각 장면의 이미지/영상 원본 파일을 받아 요청한 재생시간만큼의 개별 세그먼트(mp4)로 인코딩
 //     (이미지: -loop 1, 영상: -stream_loop -1 로 짧으면 반복해서 채우고 길면 잘라냅니다)
+//     ─ 2026-07-23: 세그먼트끼리는 서로 독립적이므로 여러 개를 동시에(병렬) 인코딩합니다
+//       (runWithConcurrency). 장면이 많은 프로젝트일수록 내보내기 시간이 크게 줄어듭니다.
 //  2) 모든 세그먼트를 같은 코덱/해상도로 만들었기 때문에 concat demuxer로 이어붙입니다
 //  3) 클라이언트가 만든 SRT 자막을 libass 기반 subtitles 필터로 영상에 "굽습니다"(burn-in)
+//     ─ 2026-07-23: 자막 스타일 프리셋(굵은 화이트/옐로우 강조/블랙 박스 등) 지원 추가
 //  4) 결과 mp4 + srt + txt 세 파일을 임시 작업 폴더에 저장하고, 다운로드용 jobId를 반환합니다
 //     (실제 다운로드는 GET /api/export/video/[jobId]/[filename])
 //
 // Windows 드라이브 문자(C:\...)의 콜론 이스케이프 문제를 피하기 위해, ffmpeg 실행 시 항상
 // cwd를 작업 폴더로 지정하고 파일명은 상대경로(예: "seg_00.mp4")만 사용합니다.
+//
+// FFmpeg 실행 파일은 resolveFfmpegPath로 자동 탐지합니다 (2026-07-25: 프로젝트에 동봉된
+// ffmpeg을 최우선으로 사용 — 설정 화면의 경로 지정 UI는 제거되었습니다). 그래도 PATH나
+// OS별 흔한 설치 위치는 폴백으로 계속 시도해 "실제 작업 가능한" 안정성을 높입니다.
 
-import { mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdir, writeFile, rm, copyFile } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
-import { runFfmpeg, normalizeVideoFilter } from '@/lib/server/ffmpeg';
+import { runFfmpeg, normalizeVideoFilter, resolveFfmpegPath, runWithConcurrency } from '@/lib/server/ffmpeg';
+import { getCaptionStylePreset } from '@/lib/captionStyles';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -23,6 +31,10 @@ export const dynamic = 'force-dynamic';
 const EXPORT_ROOT = path.join(os.tmpdir(), 'kwjmvideoai-export');
 const MAX_SCENES = 80;
 const CLEANUP_DELAY_MS = 30 * 60 * 1000; // 30분 뒤 임시 파일 정리
+
+// 세그먼트 병렬 인코딩 동시 실행 개수. CPU 코어 수에 맞춰 자동 조정하되, 로컬 개발 PC에서
+// 과도한 자원 점유가 없도록 4개로 상한을 둡니다.
+const SEGMENT_CONCURRENCY = Math.max(1, Math.min(4, os.cpus()?.length ?? 2));
 
 interface ManifestScene {
   fileField: string;
@@ -35,8 +47,8 @@ interface ExportManifest {
   width: number;
   height: number;
   fps: number;
-  ffmpegPath?: string;
   subtitleFontName?: string;
+  captionStyle?: string;
   scenes: ManifestScene[];
   srtContent: string;
   txtContent: string;
@@ -60,6 +72,8 @@ function guessExt(file: File): string {
 function jsonError(status: number, error: string, extra?: Record<string, unknown>) {
   return Response.json({ error, ...extra }, { status });
 }
+
+type SegmentResult = { ok: true; segName: string } | { ok: false; index: number; stderr: string };
 
 export async function POST(req: Request) {
   let jobDir = '';
@@ -85,22 +99,29 @@ export async function POST(req: Request) {
     const width = Number(manifest.width) || 1280;
     const height = Number(manifest.height) || 720;
     const fps = Number(manifest.fps) || 30;
-    const ffmpegPath = manifest.ffmpegPath?.trim() || 'ffmpeg';
     const fontName = manifest.subtitleFontName?.trim();
+
+    const resolvedFfmpeg = await resolveFfmpegPath();
+    if (!resolvedFfmpeg) {
+      return jsonError(
+        500,
+        'FFmpeg을 찾을 수 없습니다. 프로젝트에 동봉된 ffmpeg 실행 파일이 없거나 실행할 수 없는 상태입니다.',
+        { stage: 'ffmpeg_missing' }
+      );
+    }
+    const ffmpegPath = resolvedFfmpeg.path;
 
     const jobId = crypto.randomUUID();
     jobDir = path.join(EXPORT_ROOT, jobId);
     await mkdir(jobDir, { recursive: true });
 
-    // 1) 원본 파일 저장 + 씬별 세그먼트 인코딩
+    // 1) 원본 파일 저장 + 씬별 세그먼트 인코딩 (동시 SEGMENT_CONCURRENCY개씩 병렬 처리)
     const vf = normalizeVideoFilter(width, height, fps);
-    const segmentFiles: string[] = [];
 
-    for (let i = 0; i < manifest.scenes.length; i++) {
-      const scene = manifest.scenes[i];
+    const segmentResults = await runWithConcurrency(manifest.scenes, SEGMENT_CONCURRENCY, async (scene, i) => {
       const file = formData.get(scene.fileField);
       if (!(file instanceof File)) {
-        return jsonError(400, `${i + 1}번째 장면의 파일(${scene.fileField})을 받지 못했습니다.`);
+        return { ok: false, index: i, stderr: `${i + 1}번째 장면의 파일(${scene.fileField})을 받지 못했습니다.` } as SegmentResult;
       }
       const ext = guessExt(file);
       const rawName = `raw_${String(i).padStart(3, '0')}${ext}`;
@@ -117,13 +138,19 @@ export async function POST(req: Request) {
 
       const result = await runFfmpeg(ffmpegPath, args, jobDir);
       if (result.code !== 0) {
-        return jsonError(500, `${i + 1}번째 장면을 인코딩하는 중 FFmpeg 오류가 발생했습니다.`, {
-          stage: 'segment_encode',
-          ffmpegStderr: result.stderr.slice(-3000),
-        });
+        return { ok: false, index: i, stderr: result.stderr.slice(-3000) } as SegmentResult;
       }
-      segmentFiles.push(segName);
+      return { ok: true, segName } as SegmentResult;
+    });
+
+    const failure = segmentResults.find((r): r is Extract<SegmentResult, { ok: false }> => !r.ok);
+    if (failure) {
+      return jsonError(500, `${failure.index + 1}번째 장면을 인코딩하는 중 FFmpeg 오류가 발생했습니다.`, {
+        stage: 'segment_encode',
+        ffmpegStderr: failure.stderr,
+      });
     }
+    const segmentFiles = segmentResults.map((r) => (r as Extract<SegmentResult, { ok: true }>).segName);
 
     // 2) concat
     const listContent = segmentFiles.map((f) => `file '${f}'`).join('\n') + '\n';
@@ -145,16 +172,8 @@ export async function POST(req: Request) {
     await writeFile(path.join(jobDir, 'subtitles.srt'), srtContent, 'utf-8');
 
     if (srtContent.trim()) {
-      const styleParts = [
-        'FontSize=26',
-        'PrimaryColour=&HFFFFFF&',
-        'OutlineColour=&H000000&',
-        'BorderStyle=1',
-        'Outline=2',
-        'Shadow=0',
-        'Alignment=2',
-        'MarginV=48',
-      ];
+      const preset = getCaptionStylePreset(manifest.captionStyle);
+      const styleParts = [...preset.assStyle];
       if (fontName) styleParts.unshift(`FontName=${fontName}`);
       const subtitleFilter = `subtitles=subtitles.srt:force_style='${styleParts.join(',')}'`;
 
@@ -171,7 +190,6 @@ export async function POST(req: Request) {
       }
     } else {
       // 자막이 아예 없으면 굽기 단계를 건너뛰고 concat 결과를 그대로 사용합니다.
-      const { copyFile } = await import('node:fs/promises');
       await copyFile(path.join(jobDir, 'concat.mp4'), path.join(jobDir, 'output.mp4'));
     }
 
@@ -193,6 +211,7 @@ export async function POST(req: Request) {
       ok: true,
       jobId,
       files: { mp4: 'output.mp4', srt: 'output.srt', txt: 'output.txt' },
+      ffmpegSource: resolvedFfmpeg.source,
     });
   } catch (err: any) {
     console.error(err);

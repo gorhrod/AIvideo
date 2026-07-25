@@ -2,7 +2,7 @@
 
 import React, { useState, useRef, useEffect } from 'react';
 import { useStore, sanitizeScenesForSave } from '@/store/useStore';
-import type { Scene, Project } from '@/store/useStore';
+import type { Scene, Project, LlmMode } from '@/store/useStore';
 import {
   isFileSystemAccessSupported,
   pickDirectory,
@@ -15,23 +15,29 @@ import {
   fileHandleToObjectUrl,
   type MediaFileEntry,
 } from '@/lib/fsAccess';
-import { cn, getSceneImageSrc, formatShortDateTime } from '@/lib/utils';
+import { cn, getSceneImageSrc, formatShortDateTime, getExportResolution } from '@/lib/utils';
 import {
   filterPostsByDateRange,
   getMediaForPosts,
   blogMediaPreviewUrl,
   blogMediaFileName,
+  stripHtml,
   type BlogMediaMeta,
 } from '@/lib/blogData';
 import {
   streamChat,
   checkLlmHealth,
   generateStoryboardFromChat,
+  generateStoryboardFromMedia,
+  generateStoryboardFromPosts,
   regenerateSceneNarration,
   CHAT_SYSTEM_PROMPT,
   buildBlogContextText,
+  type MediaDescriptor,
+  type PostTextDescriptor,
 } from '@/lib/llm';
 import { buildSrt, buildPlainTextScript, totalDuration } from '@/lib/subtitles';
+import { CAPTION_STYLE_PRESETS, DEFAULT_CAPTION_STYLE_ID } from '@/lib/captionStyles';
 import {
   Film,
   MessageSquare,
@@ -69,6 +75,13 @@ import {
   Newspaper,
   Send,
   Wand2,
+  WifiOff,
+  CheckSquare,
+  Images,
+  Zap,
+  Gauge,
+  Search,
+  ImageOff,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
@@ -123,9 +136,10 @@ async function resolveScenesWithBlogMedia(
   blogDirHandle: any,
   blogMedia: BlogMediaMeta[]
 ): Promise<Scene[]> {
-  const result: Scene[] = [];
-  for (let i = 0; i < scenes.length; i++) {
-    const base = scenes[i];
+  // 2026-07-23: 각 장면의 미디어 파일 읽기는 서로 독립적이므로 순차 대기 대신 병렬로 처리해
+  // 장면 수가 많은 프로젝트에서 스토리보드 생성 체감 속도를 높입니다.
+  return Promise.all(
+    scenes.map(async (base, i) => {
     const mediaId = mediaIds[i];
     let photoRef = '';
     let localImageName: string | undefined;
@@ -160,18 +174,18 @@ async function resolveScenesWithBlogMedia(
       photoRef = getRecommendations({ tags: base.tags } as Scene)[0] ?? RECOMMEND_POOLS.beach[0];
     }
 
-    result.push({
-      id: genId('scene'),
-      ...base,
-      photoRef,
-      localImageName,
-      localVideoName,
-      localVideoUrl,
-      sourceMediaId,
-      sourcePostId,
-    });
-  }
-  return result;
+      return {
+        id: genId('scene'),
+        ...base,
+        photoRef,
+        localImageName,
+        localVideoName,
+        localVideoUrl,
+        sourceMediaId,
+        sourcePostId,
+      };
+    })
+  );
 }
 
 function genId(prefix: string): string {
@@ -181,12 +195,20 @@ function genId(prefix: string): string {
 // ─── Main App ─────────────────────────────────────────────────────────────────
 
 export default function AppRoot() {
-  const { view, setView, modal, setModal, darkMode, setDarkMode } = useStore();
+  const { view, setView, modal, setModal, darkMode, setDarkMode, initStorage } = useStore();
 
   useEffect(() => {
     if (darkMode) document.documentElement.classList.add('dark');
     else document.documentElement.classList.remove('dark');
   }, [darkMode]);
+
+  // 2026-07-25: 앱을 열 때마다 1회, 저장 폴더를 자동으로 준비합니다 — 기억해둔 폴더에
+  // 조용히 재연결을 시도하고, 안 되면 브라우저 내부 자동 저장소(OPFS)로 즉시 연결해
+  // 사용자가 폴더를 고르지 않아도 바로 자동저장이 시작되도록 합니다.
+  useEffect(() => {
+    initStorage();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <div
@@ -297,6 +319,9 @@ export default function AppRoot() {
       {/* ── Storage Bar (저장 폴더 / 미디어 폴더 상태) ───────────────────────── */}
       <StorageBar darkMode={darkMode} />
 
+      {/* ── AI(LM Studio) 연결 안내 배너 ──────────────────────────────────── */}
+      <LlmOfflineBanner darkMode={darkMode} onOpenSettings={() => setModal('settings')} />
+
       {/* ── Main ───────────────────────────────────────────────────────────── */}
       <main className="flex-1 min-h-0 overflow-hidden flex">
         <AnimatePresence mode="wait">
@@ -402,6 +427,59 @@ function LlmStatusBadge({ darkMode, onClick }: { darkMode: boolean; onClick: () 
   );
 }
 
+// ─── AI(LM Studio) 오프라인 안내 배너 ────────────────────────────────────────────
+//
+// LlmStatusBadge의 작은 점만으로는 "지금 AI 기능을 쓸 수 없다"는 사실을 놓치기 쉽습니다.
+// 채팅으로 대화하거나, 미디어를 골라 AI 스토리보드를 만들거나, 장면을 AI로 재생성하려는
+// 시도가 전부 이 상태에 걸려 있으므로, LM Studio가 꺼져 있으면 화면 상단에 눈에 띄는
+// 배너로 "연결하세요"라고 안내합니다. 같은 오프라인 구간에서 한 번 닫으면 다시 온라인이
+// 되었다가 또 오프라인이 될 때까지는 다시 뜨지 않습니다.
+
+function LlmOfflineBanner({ darkMode, onOpenSettings }: { darkMode: boolean; onOpenSettings: () => void }) {
+  const { llmStatus } = useStore();
+  const [dismissed, setDismissed] = useState(false);
+  const prevStatus = useRef(llmStatus);
+
+  useEffect(() => {
+    if (prevStatus.current !== 'offline' && llmStatus === 'offline') setDismissed(false);
+    if (llmStatus === 'online') setDismissed(false);
+    prevStatus.current = llmStatus;
+  }, [llmStatus]);
+
+  if (llmStatus !== 'offline' || dismissed) return null;
+
+  return (
+    <div
+      className={cn(
+        'shrink-0 flex items-center justify-between gap-3 px-5 py-2 text-xs border-b',
+        darkMode ? 'bg-rose-500/10 border-rose-500/20 text-rose-300' : 'bg-rose-50 border-rose-200 text-rose-700'
+      )}
+    >
+      <div className="flex items-center gap-2 min-w-0">
+        <WifiOff className="w-4 h-4 shrink-0" />
+        <span className="truncate">
+          AI(LM Studio)가 연결되어 있지 않습니다. 채팅, 스토리보드 자동 생성, 장면 AI 재생성 기능을 사용할 수 없습니다. LM Studio 앱을 실행하고 "Local Server"를 시작한 뒤 연결해주세요.
+        </span>
+      </div>
+      <div className="flex items-center gap-2 shrink-0">
+        <button
+          onClick={onOpenSettings}
+          className="px-2.5 py-1 rounded-lg bg-rose-600 text-white font-medium hover:bg-rose-700 transition-colors"
+        >
+          연결하기
+        </button>
+        <button
+          onClick={() => setDismissed(true)}
+          className={cn('w-6 h-6 flex items-center justify-center rounded-lg', darkMode ? 'hover:bg-rose-500/20' : 'hover:bg-rose-100')}
+          title="닫기"
+        >
+          <X className="w-3.5 h-3.5" />
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // ─── Header Nav Button ────────────────────────────────────────────────────────
 
 function HeaderNavBtn({
@@ -441,6 +519,9 @@ function StorageBar({ darkMode }: { darkMode: boolean }) {
   const {
     saveDirHandle,
     saveDirName,
+    saveDirSource,
+    rememberedSaveDirName,
+    reconnectRememberedSaveFolder,
     mediaDirName,
     saveStatus,
     saveError,
@@ -455,7 +536,7 @@ function StorageBar({ darkMode }: { darkMode: boolean }) {
   } = useStore();
 
   const [fsSupported, setFsSupported] = useState(true);
-  const [busy, setBusy] = useState<'save' | 'media' | null>(null);
+  const [busy, setBusy] = useState<'save' | 'media' | 'reconnect' | null>(null);
   const [notice, setNotice] = useState<{ tone: 'ok' | 'error'; text: string } | null>(null);
 
   useEffect(() => {
@@ -475,6 +556,13 @@ function StorageBar({ darkMode }: { darkMode: boolean }) {
     if (res.message) setNotice({ tone: res.ok ? 'ok' : 'error', text: res.message });
   };
 
+  const handleReconnect = async () => {
+    setBusy('reconnect');
+    const res = await reconnectRememberedSaveFolder();
+    setBusy(null);
+    if (res.message) setNotice({ tone: res.ok ? 'ok' : 'error', text: res.message });
+  };
+
   const handleManualSave = async () => {
     setBusy('save');
     const res = await saveAllToFolder();
@@ -488,6 +576,11 @@ function StorageBar({ darkMode }: { darkMode: boolean }) {
     setBusy(null);
     if (res.message) setNotice({ tone: res.ok ? 'ok' : 'error', text: res.message });
   };
+
+  // 마지막에 연결했던 실제 폴더가 있는데, 지금은(자동으로) OPFS 자동 저장소만 붙어있는 상태면
+  // 한 번의 클릭으로 그 폴더에 다시 연결할 수 있도록 안내합니다.
+  const showReconnectHint =
+    fsSupported && rememberedSaveDirName && saveDirSource === 'opfs' && rememberedSaveDirName !== saveDirName;
 
   return (
     <div
@@ -505,7 +598,7 @@ function StorageBar({ darkMode }: { darkMode: boolean }) {
         <>
           {/* 저장 폴더 상태 */}
           <div className="flex items-center gap-1.5">
-            {saveDirHandle ? (
+            {saveDirHandle && saveDirSource === 'external' ? (
               <>
                 <FolderCheck className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
                 <span className="font-medium">저장 폴더: "{saveDirName}"</span>
@@ -520,6 +613,24 @@ function StorageBar({ darkMode }: { darkMode: boolean }) {
                   <Link2Off className="w-3.5 h-3.5" />
                 </button>
               </>
+            ) : saveDirHandle && saveDirSource === 'opfs' ? (
+              <>
+                <Save className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                <span className={cn('font-medium', darkMode ? 'text-neutral-400' : 'text-neutral-500')}>
+                  자동 저장소 사용 중 (폴더 미연결)
+                </span>
+                <button
+                  onClick={handleConnectSave}
+                  disabled={busy === 'save'}
+                  className={cn(
+                    'ml-1 flex items-center gap-1 font-medium px-2 py-0.5 rounded-md transition-colors',
+                    darkMode ? 'text-indigo-400 hover:bg-indigo-500/10' : 'text-indigo-600 hover:bg-indigo-50'
+                  )}
+                >
+                  {busy === 'save' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Link2 className="w-3.5 h-3.5" />}
+                  실제 폴더로 옮기기
+                </button>
+              </>
             ) : (
               <button
                 onClick={handleConnectSave}
@@ -531,6 +642,20 @@ function StorageBar({ darkMode }: { darkMode: boolean }) {
               >
                 {busy === 'save' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Link2 className="w-3.5 h-3.5" />}
                 저장 폴더 연결
+              </button>
+            )}
+            {showReconnectHint && (
+              <button
+                onClick={handleReconnect}
+                disabled={busy === 'reconnect'}
+                title={`이전에 연결했던 "${rememberedSaveDirName}" 폴더에 다시 연결합니다`}
+                className={cn(
+                  'ml-1 flex items-center gap-1 font-medium px-2 py-0.5 rounded-md border transition-colors',
+                  darkMode ? 'border-amber-500/30 text-amber-400 hover:bg-amber-500/10' : 'border-amber-300 text-amber-600 hover:bg-amber-50'
+                )}
+              >
+                {busy === 'reconnect' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+                "{rememberedSaveDirName}" 다시 연결
               </button>
             )}
           </div>
@@ -649,6 +774,7 @@ function ChatInterface({ onComplete, darkMode }: { onComplete: () => void; darkM
     addChatMessage,
     llmBaseUrl,
     llmModel,
+    llmMode,
     llmStatus,
     blogDirName,
     blogPosts,
@@ -702,6 +828,7 @@ function ChatInterface({ onComplete, darkMode }: { onComplete: () => void; darkM
       await streamChat(openAiMessages, {
         baseUrl: llmBaseUrl,
         model: llmModel,
+        mode: llmMode,
         temperature: 0.7,
         signal: controller.signal,
         onToken: (chunk) => {
@@ -732,7 +859,7 @@ function ChatInterface({ onComplete, darkMode }: { onComplete: () => void; darkM
         blogPosts: selectedPosts,
         blogMedia: selectedMedia,
         blogAuthorLabels,
-        settings: { baseUrl: llmBaseUrl, model: llmModel },
+        settings: { baseUrl: llmBaseUrl, model: llmModel, mode: llmMode },
       });
 
       setBuildStage('사진·영상을 장면에 배치하는 중...');
@@ -1263,7 +1390,7 @@ function SceneCard({
 // ─── Scene Editor (center) ────────────────────────────────────────────────────
 
 function SceneEditor({ scene, darkMode }: { scene: Scene; darkMode: boolean }) {
-  const { scenes, updateScene, pushEditLog, setModal, llmBaseUrl, llmModel } = useStore();
+  const { scenes, updateScene, pushEditLog, setModal, llmBaseUrl, llmModel, llmMode } = useStore();
   const [aiNotice, setAiNotice] = useState<{ tone: 'info' | 'error'; text: string } | null>(null);
   const [aiBusy, setAiBusy] = useState(false);
   const titleDraftRef = useRef(scene.customTitle);
@@ -1295,7 +1422,7 @@ function SceneEditor({ scene, darkMode }: { scene: Scene; darkMode: boolean }) {
       const { narration, dialogue } = await regenerateSceneNarration({
         scene,
         allScenes: scenes,
-        settings: { baseUrl: llmBaseUrl, model: llmModel },
+        settings: { baseUrl: llmBaseUrl, model: llmModel, mode: llmMode },
       });
       updateScene(scene.id, { narration, dialogue });
       pushEditLog('scene_ai_regenerate', `"${scene.customTitle}" 장면 나레이션 AI 재생성`);
@@ -1682,14 +1809,23 @@ function InfoRow({
 
 // ─── Modal Backdrop ────────────────────────────────────────────────────────────
 
-function ModalBackdrop({ onClose, children }: { onClose: () => void; children: React.ReactNode }) {
+function ModalBackdrop({
+  onClose,
+  children,
+  closeOnBackdropClick = true,
+}: {
+  onClose: () => void;
+  children: React.ReactNode;
+  /** false로 두면 배경(바깥) 클릭으로 닫히지 않고, 모달 안의 닫기(X) 버튼으로만 닫힙니다. */
+  closeOnBackdropClick?: boolean;
+}) {
   return (
     <motion.div
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
       className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm"
-      onClick={onClose}
+      onClick={closeOnBackdropClick ? onClose : undefined}
     >
       <motion.div
         initial={{ opacity: 0, scale: 0.95, y: 10 }}
@@ -1707,7 +1843,7 @@ function ModalBackdrop({ onClose, children }: { onClose: () => void; children: R
 // ─── New Project Modal ────────────────────────────────────────────────────────
 
 function NewProjectModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => void }) {
-  const { saveDirHandle, saveDirName, connectSaveFolder, saveNamedProject, setView } = useStore();
+  const { saveDirHandle, saveDirName, scenes, connectSaveFolder, saveNamedProject, resetForNewProject, setView } = useStore();
   const [name, setName] = useState('');
   const [saved, setSaved] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -1736,6 +1872,9 @@ function NewProjectModal({ darkMode, onClose }: { darkMode: boolean; onClose: ()
     setSaving(true);
     setErrorMsg(null);
     try {
+      // 2026-07-25: "새 프로젝트"는 항상 빈 스토리보드(0부터 시작)로 만듭니다 — 저장은 그
+      // 빈 상태를 이름 붙여 저장하는 것이고, 편집기로 이동하면 빈 타임라인에서 시작합니다.
+      resetForNewProject();
       const res = await saveNamedProject(name.trim());
       if (!res.ok) {
         setErrorMsg(res.message ?? '프로젝트를 저장하는 중 문제가 발생했습니다.');
@@ -1828,6 +1967,14 @@ function NewProjectModal({ darkMode, onClose }: { darkMode: boolean; onClose: ()
               <span>{errorMsg}</span>
             </div>
           )}
+
+          <div className="flex items-start gap-2 text-xs text-indigo-500 bg-indigo-500/10 rounded-lg px-3 py-2">
+            <Info className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+            <span>
+              새 프로젝트는 항상 빈 스토리보드(0부터)로 시작합니다.
+              {scenes.length > 0 ? ` 현재 편집 중인 장면 ${scenes.length}개는 저장하지 않았다면 사라집니다.` : ''}
+            </span>
+          </div>
         </div>
 
         <div className={cn('px-6 py-4 border-t flex justify-end gap-2', darkMode ? 'border-neutral-800' : 'border-neutral-200')}>
@@ -2125,9 +2272,7 @@ function LoadModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => vo
                   )}
                 >
                   <div className="w-20 h-12 rounded-lg overflow-hidden shrink-0 bg-neutral-200">
-                    {proj.thumbnail && (
-                      <img src={getSceneImageSrc(proj.thumbnail)} alt={proj.name} className="w-full h-full object-cover" />
-                    )}
+                    <img src={getSceneImageSrc(proj.thumbnail)} alt={proj.name} className="w-full h-full object-cover" />
                   </div>
                   <div className="flex-1 min-w-0">
                     <p className="font-semibold text-sm truncate">{proj.name}</p>
@@ -2224,12 +2369,14 @@ function openPrintableStoryboard(projectName: string, scenes: Scene[]) {
 }
 
 function ExportModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => void }) {
-  const { scenes, currentProject, saveDirHandle, saveDirName, pushEditLog, ffmpegPathOverride, subtitleFontName } = useStore();
+  const { scenes, currentProject, saveDirHandle, saveDirName, pushEditLog, subtitleFontName } = useStore();
   const projectName = currentProject?.name ?? '스토리보드';
   const [pathNote, setPathNote] = useState(currentProject ? `${currentProject.folderPath}/export` : '');
   const [format, setFormat] = useState<'pdf' | 'json' | 'txt' | 'mp4'>('pdf');
   const [alsoSaveToFolder, setAlsoSaveToFolder] = useState(true);
-  const [resolution, setResolution] = useState<'1280x720' | '1920x1080'>('1280x720');
+  const [aspect, setAspect] = useState<'16:9' | '9:16'>('16:9');
+  const [quality, setQuality] = useState<'720' | '1080'>('720');
+  const [captionStyle, setCaptionStyle] = useState<string>(DEFAULT_CAPTION_STYLE_ID);
   const [isExporting, setIsExporting] = useState(false);
   const [done, setDone] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -2251,7 +2398,7 @@ function ExportModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => 
     let cancelled = false;
     (async () => {
       try {
-        const res = await fetch(`/api/ffmpeg/check?ffmpegPath=${encodeURIComponent(ffmpegPathOverride || 'ffmpeg')}`);
+        const res = await fetch('/api/ffmpeg/check');
         const data = await res.json();
         if (!cancelled) setFfmpegOk(Boolean(data.ok));
       } catch {
@@ -2261,7 +2408,7 @@ function ExportModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => 
     return () => {
       cancelled = true;
     };
-  }, [format, ffmpegPathOverride]);
+  }, [format]);
 
   const writeExportToSaveFolder = async (fileName: string, content: string) => {
     if (!saveDirHandle) return;
@@ -2298,7 +2445,7 @@ function ExportModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => 
       manifestScenes.push({ fileField, kind, duration: sc.duration });
     }
 
-    const [width, height] = resolution.split('x').map(Number);
+    const { width, height } = getExportResolution(aspect, quality);
     const srtContent = buildSrt(scenes);
     const txtContent = buildPlainTextScript(projectName, scenes);
 
@@ -2307,8 +2454,8 @@ function ExportModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => 
       width,
       height,
       fps: 30,
-      ffmpegPath: ffmpegPathOverride || undefined,
       subtitleFontName: subtitleFontName || undefined,
+      captionStyle,
       scenes: manifestScenes,
       srtContent,
       txtContent,
@@ -2414,27 +2561,77 @@ function ExportModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => 
                 <div className="flex items-start gap-2 text-xs text-amber-500 bg-amber-500/10 rounded-lg px-3 py-2">
                   <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
                   <span>
-                    이 컴퓨터에서 FFmpeg을 찾지 못했습니다. FFmpeg을 설치해 PATH에 추가하거나, 헤더의 "설정"에서 FFmpeg 실행 파일 경로를 직접 지정해주세요. (설치 안내: ffmpeg.org/download.html)
+                    이 컴퓨터에서 FFmpeg을 찾지 못했습니다. 프로젝트에 동봉된 ffmpeg 실행 파일(ffmpeg/bin/ffmpeg.exe)이 있는지 확인해주세요. (설치 안내: ffmpeg.org/download.html)
                   </span>
                 </div>
               )}
               <div>
-                <label className="text-xs font-semibold mb-1.5 block text-indigo-500">해상도</label>
+                <label className="text-xs font-semibold mb-1.5 block text-indigo-500">화면비율</label>
                 <div className="flex gap-2">
-                  {(['1280x720', '1920x1080'] as const).map((r) => (
+                  {([
+                    { id: '16:9' as const, label: '16:9 가로', hint: '유튜브/일반 영상' },
+                    { id: '9:16' as const, label: '9:16 세로', hint: '쇼츠/릴스/틱톡' },
+                  ]).map((a) => (
                     <button
-                      key={r}
-                      onClick={() => setResolution(r)}
+                      key={a.id}
+                      onClick={() => setAspect(a.id)}
                       className={cn(
                         'flex-1 py-2 rounded-lg text-xs font-medium border transition-colors',
-                        resolution === r
+                        aspect === a.id
                           ? 'border-indigo-500 bg-indigo-50 dark:bg-indigo-500/10 text-indigo-600'
                           : darkMode
                           ? 'border-neutral-800 text-neutral-400'
                           : 'border-neutral-200 text-neutral-500'
                       )}
                     >
-                      {r === '1280x720' ? '720p (빠름)' : '1080p (고화질)'}
+                      {a.label}
+                      <span className="block text-[10px] opacity-70 font-normal">{a.hint}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <label className="text-xs font-semibold mb-1.5 block text-indigo-500">화질</label>
+                <div className="flex gap-2">
+                  {(['720', '1080'] as const).map((q) => (
+                    <button
+                      key={q}
+                      onClick={() => setQuality(q)}
+                      className={cn(
+                        'flex-1 py-2 rounded-lg text-xs font-medium border transition-colors',
+                        quality === q
+                          ? 'border-indigo-500 bg-indigo-50 dark:bg-indigo-500/10 text-indigo-600'
+                          : darkMode
+                          ? 'border-neutral-800 text-neutral-400'
+                          : 'border-neutral-200 text-neutral-500'
+                      )}
+                    >
+                      {q === '720' ? '720p (빠름)' : '1080p (고화질)'}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <label className="text-xs font-semibold mb-1.5 block text-indigo-500">자막 스타일</label>
+                <div className="grid grid-cols-2 gap-2">
+                  {CAPTION_STYLE_PRESETS.map((preset) => (
+                    <button
+                      key={preset.id}
+                      onClick={() => setCaptionStyle(preset.id)}
+                      title={preset.description}
+                      className={cn(
+                        'py-2 px-2.5 rounded-lg border transition-colors text-left',
+                        captionStyle === preset.id
+                          ? 'border-indigo-500 bg-indigo-50 dark:bg-indigo-500/10'
+                          : darkMode
+                          ? 'border-neutral-800'
+                          : 'border-neutral-200'
+                      )}
+                    >
+                      <span className={cn('block text-xs font-bold truncate', preset.previewClassName)}>가나다 ABC</span>
+                      <span className={cn('block text-[10px] mt-0.5 truncate', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>
+                        {preset.label}
+                      </span>
                     </button>
                   ))}
                 </div>
@@ -2585,15 +2782,15 @@ function SettingsModal({ darkMode, onClose }: { darkMode: boolean; onClose: () =
     llmModel,
     setLlmModel,
     llmAvailableModels,
-    ffmpegPathOverride,
-    setFfmpegPathOverride,
+    llmMode,
+    setLlmMode,
     subtitleFontName,
     setSubtitleFontName,
   } = useStore();
 
   const [baseUrlDraft, setBaseUrlDraft] = useState(llmBaseUrl);
   const [modelDraft, setModelDraft] = useState(llmModel);
-  const [ffmpegDraft, setFfmpegDraft] = useState(ffmpegPathOverride);
+  const [modeDraft, setModeDraft] = useState<LlmMode>(llmMode);
   const [fontDraft, setFontDraft] = useState(subtitleFontName);
 
   const [llmCheck, setLlmCheck] = useState<{ busy: boolean; ok: boolean | null; message: string; models: string[] }>({
@@ -2622,9 +2819,10 @@ function SettingsModal({ darkMode, onClose }: { darkMode: boolean; onClose: () =
   const handleCheckFfmpeg = async () => {
     setFfmpegCheck((s) => ({ ...s, busy: true }));
     try {
-      const res = await fetch(`/api/ffmpeg/check?ffmpegPath=${encodeURIComponent(ffmpegDraft || 'ffmpeg')}`);
+      const res = await fetch('/api/ffmpeg/check');
       const data = await res.json();
-      setFfmpegCheck({ busy: false, ok: Boolean(data.ok), message: data.ok ? data.version : data.error });
+      const okMessage = data.source ? `${data.version} — ${data.source}에서 찾음` : data.version;
+      setFfmpegCheck({ busy: false, ok: Boolean(data.ok), message: data.ok ? okMessage : data.error });
     } catch (err: any) {
       setFfmpegCheck({ busy: false, ok: false, message: err?.message ?? 'FFmpeg 확인 중 오류' });
     }
@@ -2633,7 +2831,7 @@ function SettingsModal({ darkMode, onClose }: { darkMode: boolean; onClose: () =
   const handleSave = () => {
     setLlmBaseUrl(baseUrlDraft.trim() || 'http://localhost:1234/v1');
     setLlmModel(modelDraft.trim());
-    setFfmpegPathOverride(ffmpegDraft.trim());
+    setLlmMode(modeDraft);
     setSubtitleFontName(fontDraft.trim());
     onClose();
   };
@@ -2643,6 +2841,12 @@ function SettingsModal({ darkMode, onClose }: { darkMode: boolean; onClose: () =
     'w-full px-3 py-2 text-sm rounded-lg border focus:outline-none focus:ring-2 focus:ring-indigo-500/40 font-mono',
     darkMode ? 'bg-neutral-800 border-neutral-700 text-neutral-100' : 'bg-neutral-50 border-neutral-200 text-neutral-900'
   );
+
+  const modeOptions: { id: LlmMode; label: string; desc: string; icon: React.ReactNode }[] = [
+    { id: 'fast', label: '빠른모드', desc: '속도 위주 (응답이 가장 빠름)', icon: <Zap className="w-4 h-4" /> },
+    { id: 'normal', label: '보통모드', desc: '가성비 (기본값)', icon: <Gauge className="w-4 h-4" /> },
+    { id: 'expert', label: '전문가모드', desc: '토큰을 많이 써서 더 자세하고 품질 높은 결과', icon: <Sparkles className="w-4 h-4" /> },
+  ];
 
   return (
     <ModalBackdrop onClose={onClose}>
@@ -2689,6 +2893,35 @@ function SettingsModal({ darkMode, onClose }: { darkMode: boolean; onClose: () =
                 </div>
               )}
             </div>
+
+            <div>
+              <label className="text-xs mb-1.5 block text-neutral-500">응답 모드</label>
+              <div className="grid grid-cols-3 gap-2">
+                {modeOptions.map((opt) => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    onClick={() => setModeDraft(opt.id)}
+                    title={opt.desc}
+                    className={cn(
+                      'flex flex-col items-center gap-1 rounded-lg border px-2 py-2.5 text-center transition-colors',
+                      modeDraft === opt.id
+                        ? 'border-indigo-500 bg-indigo-500/10 text-indigo-500'
+                        : darkMode
+                        ? 'border-neutral-700 text-neutral-400 hover:border-neutral-600'
+                        : 'border-neutral-200 text-neutral-500 hover:border-neutral-300'
+                    )}
+                  >
+                    {opt.icon}
+                    <span className="text-xs font-semibold">{opt.label}</span>
+                  </button>
+                ))}
+              </div>
+              <p className={cn('text-[11px] mt-1.5', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>
+                {modeOptions.find((o) => o.id === modeDraft)?.desc}
+              </p>
+            </div>
+
             <div className="flex items-center gap-2">
               <button
                 onClick={handleCheckLlm}
@@ -2712,10 +2945,9 @@ function SettingsModal({ darkMode, onClose }: { darkMode: boolean; onClose: () =
           {/* FFmpeg */}
           <div className="space-y-2.5">
             <h3 className="text-xs font-semibold uppercase tracking-widest text-indigo-500">FFmpeg (MP4 내보내기)</h3>
-            <div>
-              <label className="text-xs mb-1 block text-neutral-500">FFmpeg 실행 파일 경로 (비워두면 시스템 PATH의 ffmpeg 사용)</label>
-              <input value={ffmpegDraft} onChange={(e) => setFfmpegDraft(e.target.value)} placeholder="예: C:\ffmpeg\bin\ffmpeg.exe" className={inputCls} />
-            </div>
+            <p className={cn('text-[11px] leading-relaxed', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>
+              프로젝트 내부에 동봉된 FFmpeg을 자동으로 사용합니다. 별도 경로 설정이 필요 없습니다.
+            </p>
             <div>
               <label className="text-xs mb-1 block text-neutral-500">자막 폰트 이름 (선택, 비워두면 시스템 기본 폰트)</label>
               <input value={fontDraft} onChange={(e) => setFontDraft(e.target.value)} placeholder="예: Malgun Gothic" className={inputCls} />
@@ -2762,18 +2994,39 @@ function BlogImportModal({ darkMode, onClose }: { darkMode: boolean; onClose: ()
     connectBlogDataFolder,
     disconnectBlogDataFolder,
     addChatMessage,
+    llmBaseUrl,
+    llmModel,
+    llmMode,
+    llmStatus,
+    setScenes,
+    setSelectedSceneId,
+    setCurrentProject,
+    setView,
+    pushEditLog,
   } = useStore();
 
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<{ tone: 'ok' | 'error'; text: string } | null>(null);
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
+  const [searchQuery, setSearchQuery] = useState('');
   const [checked, setChecked] = useState<Set<string>>(new Set(blogSelectedPostIds));
   const [previewUrls, setPreviewUrls] = useState<Record<string, string>>({});
+  const [building, setBuilding] = useState(false);
+  const [buildStage, setBuildStage] = useState('');
 
-  const filteredPosts = filterPostsByDateRange(blogPosts, dateFrom || undefined, dateTo || undefined).sort(
+  const dateFilteredPosts = filterPostsByDateRange(blogPosts, dateFrom || undefined, dateTo || undefined).sort(
     (a, b) => (a.createdAt < b.createdAt ? 1 : -1)
   );
+
+  // 2026-07-25: 블로그에서 가져오기 검색 — 제목/본문/장소에서 검색어를 찾습니다.
+  const normalizedQuery = searchQuery.trim().toLowerCase();
+  const filteredPosts = normalizedQuery
+    ? dateFilteredPosts.filter((p) => {
+        const haystack = `${p.title} ${stripHtml(p.content)} ${p.location ?? ''}`.toLowerCase();
+        return haystack.includes(normalizedQuery);
+      })
+    : dateFilteredPosts;
 
   useEffect(() => {
     if (!blogDirHandle) return;
@@ -2828,10 +3081,153 @@ function BlogImportModal({ darkMode, onClose }: { darkMode: boolean; onClose: ()
     onClose();
   };
 
+
+  /**
+   * 채팅으로 컨셉을 먼저 정하지 않고, 선택한 블로그 글로 AI가 바로 스토리보드를 만듭니다.
+   * 글의 실제 캡션/장소/날짜/본문 정보를 그대로 LLM에 전달하므로 사실이 아닌 내용을
+   * 지어내지 않습니다. 결과는 새 프로젝트로 편집기에 바로 열립니다.
+   *
+   * 2026-07-25: 예전에는 선택한 글에 사진/영상이 하나도 없으면 무조건 오류로 막았지만,
+   * 이제는 글(텍스트)만 있어도 나레이션 장면을 만들 수 있습니다. 사진/영상이 있는 글은
+   * 그 사진/영상 하나당 장면 하나씩, 사진/영상이 없는 글은 본문 내용으로 장면 하나씩
+   * 만들어 "글이나 사진이 있으면 모두" 스토리보드에 포함시킵니다.
+   */
+  const handleBuildStoryboardFromBlog = async () => {
+    if (building || checked.size === 0) return;
+    if (llmStatus === 'offline') {
+      setNotice({ tone: 'error', text: 'AI(LM Studio)가 연결되어 있지 않습니다. 헤더의 "설정"에서 먼저 연결해주세요.' });
+      return;
+    }
+    setBuilding(true);
+    setNotice(null);
+    setBuildStage('선택한 글을 분석하는 중...');
+    try {
+      const ids = Array.from(checked).sort((a, b) => {
+        const pa = blogPosts.find((p) => p.id === a)?.createdAt ?? '';
+        const pb = blogPosts.find((p) => p.id === b)?.createdAt ?? '';
+        return pa < pb ? -1 : pa > pb ? 1 : 0;
+      });
+      const posts = blogPosts.filter((p) => ids.includes(p.id));
+      const media = getMediaForPosts(blogMedia, ids);
+      const postsWithMediaIds = new Set(media.map((m) => m.postId));
+      const textOnlyPosts = posts.filter((p) => !postsWithMediaIds.has(p.id));
+
+      // 사진/영상이 있는 글 → 미디어 개수만큼 장면 생성 (기존 방식)
+      const scenesByPostId = new Map<string, Scene[]>();
+
+      if (media.length > 0) {
+        setBuildStage('선택한 글의 사진·영상에 나레이션을 작성하는 중...');
+        const descriptors: MediaDescriptor[] = media.map((m) => {
+          const post = posts.find((p) => p.id === m.postId);
+          return {
+            label: blogMediaFileName(m.url),
+            kind: m.type,
+            caption: m.caption || undefined,
+            location: m.location || post?.location || undefined,
+            date: `${m.year}-${m.month}-${m.day}`,
+          };
+        });
+        const written = await generateStoryboardFromMedia({
+          items: descriptors,
+          settings: { baseUrl: llmBaseUrl, model: llmModel, mode: llmMode },
+        });
+
+        setBuildStage('사진·영상 파일을 장면에 연결하는 중...');
+        await Promise.all(
+          media.map(async (m, i) => {
+            const base = written[i];
+            const url = (await blogMediaPreviewUrl(blogDirHandle, m)) ?? '';
+            const fileName = blogMediaFileName(m.url);
+            const scene: Scene =
+              m.type === 'video'
+                ? {
+                    id: genId('scene'),
+                    ...base,
+                    photoRef: '',
+                    localVideoName: fileName,
+                    localVideoUrl: url,
+                    sourcePostId: m.postId,
+                    sourceMediaId: m.id,
+                  }
+                : {
+                    id: genId('scene'),
+                    ...base,
+                    photoRef: url,
+                    localImageName: fileName,
+                    sourcePostId: m.postId,
+                    sourceMediaId: m.id,
+                  };
+            const list = scenesByPostId.get(m.postId) ?? [];
+            list.push(scene);
+            scenesByPostId.set(m.postId, list);
+          })
+        );
+      }
+
+      // 사진/영상이 없는 글 → 본문 내용으로 나레이션만 있는 장면 1개씩 생성
+      // (화면에는 아이콘 기반 "이미지 없음" 표시가 나타납니다)
+      if (textOnlyPosts.length > 0) {
+        setBuildStage('사진·영상이 없는 글은 본문 내용으로 장면을 작성하는 중...');
+        const textDescriptors: PostTextDescriptor[] = textOnlyPosts.map((p) => ({
+          id: p.id,
+          title: p.title,
+          content: stripHtml(p.content),
+          location: p.location || undefined,
+          date: p.createdAt?.slice(0, 10),
+        }));
+        const writtenText = await generateStoryboardFromPosts({
+          items: textDescriptors,
+          settings: { baseUrl: llmBaseUrl, model: llmModel, mode: llmMode },
+        });
+        textOnlyPosts.forEach((p, i) => {
+          const base = writtenText[i];
+          const scene: Scene = {
+            id: genId('scene'),
+            ...base,
+            photoRef: '',
+            sourcePostId: p.id,
+          };
+          scenesByPostId.set(p.id, [scene]);
+        });
+      }
+
+      // 글 원래 순서(날짜순)를 유지하며 합칩니다.
+      const newScenes: Scene[] = posts.flatMap((p) => scenesByPostId.get(p.id) ?? []);
+
+      if (newScenes.length === 0) {
+        setNotice({ tone: 'error', text: '스토리보드로 만들 내용이 없습니다. 글을 다시 선택해주세요.' });
+        return;
+      }
+
+      setScenes(newScenes);
+      setSelectedSceneId(newScenes[0]?.id ?? null);
+      const now = new Date().toISOString();
+      setCurrentProject({
+        id: genId('proj'),
+        name: posts[0]?.title ? `${posts[0].title} 외 ${Math.max(0, posts.length - 1)}개 글` : '새 스토리보드',
+        folderPath: '',
+        createdAt: now,
+        modifiedAt: now,
+        scenes: newScenes,
+      });
+      pushEditLog(
+        'storyboard_generate',
+        `블로그 글 ${posts.length}개(사진·영상 장면 ${media.length}개, 텍스트 장면 ${textOnlyPosts.length}개)로 스토리보드 생성`
+      );
+      setView('editor');
+      onClose();
+    } catch (err: any) {
+      setNotice({ tone: 'error', text: `스토리보드를 만드는 중 문제가 발생했습니다: ${err?.message ?? '알 수 없는 오류'}` });
+    } finally {
+      setBuilding(false);
+      setBuildStage('');
+    }
+  };
+
   const modalBg = darkMode ? 'bg-neutral-900 border-neutral-800' : 'bg-white border-neutral-200';
 
   return (
-    <ModalBackdrop onClose={onClose}>
+    <ModalBackdrop onClose={onClose} closeOnBackdropClick={false}>
       <div className={cn('w-full max-w-2xl rounded-2xl border shadow-2xl max-h-[85vh] flex flex-col', modalBg)}>
         <div className={cn('shrink-0 flex items-center justify-between px-6 py-4 border-b', darkMode ? 'border-neutral-800' : 'border-neutral-200')}>
           <div className="flex items-center gap-2">
@@ -2875,9 +3271,46 @@ function BlogImportModal({ darkMode, onClose }: { darkMode: boolean; onClose: ()
               </div>
 
               <div className="flex items-center gap-2">
+                <div className="relative flex-1 min-w-[140px]">
+                  <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-neutral-400" />
+                  <input
+                    type="text"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    placeholder="제목·내용·장소 검색"
+                    className={cn(
+                      'w-full pl-8 pr-2.5 py-1.5 text-xs rounded-lg border',
+                      darkMode ? 'bg-neutral-800 border-neutral-700' : 'bg-neutral-50 border-neutral-200'
+                    )}
+                  />
+                </div>
                 <input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} className={cn('px-2.5 py-1.5 text-xs rounded-lg border', darkMode ? 'bg-neutral-800 border-neutral-700' : 'bg-neutral-50 border-neutral-200')} />
                 <span className="text-xs text-neutral-400">~</span>
                 <input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} className={cn('px-2.5 py-1.5 text-xs rounded-lg border', darkMode ? 'bg-neutral-800 border-neutral-700' : 'bg-neutral-50 border-neutral-200')} />
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setChecked(new Set(filteredPosts.map((p) => p.id)))}
+                  disabled={filteredPosts.length === 0}
+                  className={cn(
+                    'flex items-center gap-1 text-[11px] px-2 py-1 rounded-md border font-medium transition-colors disabled:opacity-40',
+                    darkMode ? 'border-neutral-700 text-neutral-300 hover:border-neutral-600' : 'border-neutral-200 text-neutral-600 hover:border-neutral-300'
+                  )}
+                  title="글이나 사진/영상이 있으면 모두 스토리보드에 사용합니다"
+                >
+                  <CheckSquare className="w-3 h-3" /> 검색된 글 모두 선택
+                </button>
+                {checked.size > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setChecked(new Set())}
+                    className={cn('text-[11px] px-2 py-1 rounded-md', darkMode ? 'text-neutral-500 hover:text-neutral-300' : 'text-neutral-400 hover:text-neutral-600')}
+                  >
+                    선택 해제
+                  </button>
+                )}
                 <span className={cn('text-xs ml-auto', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>{checked.size}개 선택됨</span>
               </div>
 
@@ -2908,7 +3341,7 @@ function BlogImportModal({ darkMode, onClose }: { darkMode: boolean; onClose: ()
                         {preview ? (
                           <img src={preview} alt={post.title} className="w-full h-full object-cover" />
                         ) : (
-                          <ImageIcon className="w-4 h-4 text-neutral-400" />
+                          <ImageOff className="w-4 h-4 text-neutral-400" />
                         )}
                       </div>
                       <div className="min-w-0 flex-1">
@@ -2924,7 +3357,7 @@ function BlogImportModal({ darkMode, onClose }: { darkMode: boolean; onClose: ()
                           <p className="text-xs font-medium truncate">{post.title}</p>
                         </div>
                         <p className={cn('text-[11px] mt-0.5 truncate', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>
-                          {post.createdAt.slice(0, 10)}{post.location ? ` · ${post.location}` : ''} · 사진/영상 {mediaCount}개
+                          {post.createdAt.slice(0, 10)}{post.location ? ` · ${post.location}` : ''} · {mediaCount > 0 ? `사진/영상 ${mediaCount}개` : '사진/영상 없음 (글 내용으로 생성)'}
                         </p>
                       </div>
                     </button>
@@ -2932,6 +3365,15 @@ function BlogImportModal({ darkMode, onClose }: { darkMode: boolean; onClose: ()
                 })}
               </div>
             </>
+          )}
+
+          {building && (
+            <div className="flex items-center gap-2 text-xs text-emerald-500 bg-emerald-500/10 rounded-lg px-3 py-2">
+              <Loader2 className="w-3.5 h-3.5 animate-spin" /> {buildStage || 'AI가 스토리보드를 만드는 중...'}
+            </div>
+          )}
+          {notice && !building && (
+            <p className={cn('text-xs', notice.tone === 'ok' ? 'text-emerald-500' : 'text-rose-500')}>{notice.text}</p>
           )}
         </div>
 
@@ -2943,9 +3385,19 @@ function BlogImportModal({ darkMode, onClose }: { darkMode: boolean; onClose: ()
             <button
               onClick={handleApply}
               disabled={checked.size === 0}
-              className="px-5 py-2 text-sm rounded-lg font-medium bg-sky-600 hover:bg-sky-700 disabled:opacity-50 text-white flex items-center gap-1.5"
+              title="선택한 글을 채팅 컨텍스트로 가져와 대화하며 스토리보드를 만듭니다"
+              className="px-4 py-2 text-sm rounded-lg font-medium bg-sky-600 hover:bg-sky-700 disabled:opacity-50 text-white flex items-center gap-1.5"
             >
-              <Check className="w-4 h-4" /> 선택한 글 {checked.size}개 가져오기
+              <Check className="w-4 h-4" /> 채팅으로 가져오기
+            </button>
+            <button
+              onClick={handleBuildStoryboardFromBlog}
+              disabled={checked.size === 0 || building || llmStatus === 'offline'}
+              title={llmStatus === 'offline' ? 'AI(LM Studio) 연결이 필요합니다' : '선택한 글의 사진·영상, 그리고 사진/영상이 없는 글은 본문 내용으로 AI가 바로 스토리보드를 만듭니다'}
+              className="px-4 py-2 text-sm rounded-lg font-medium bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white flex items-center gap-1.5"
+            >
+              {building ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wand2 className="w-4 h-4" />}
+              AI로 바로 스토리보드 만들기
             </button>
           </div>
         )}
@@ -2967,6 +3419,15 @@ function MediaLibraryModal({ darkMode, onClose }: { darkMode: boolean; onClose: 
     selectedSceneId,
     applyImageToScene,
     applyLocalVideoToScene,
+    llmBaseUrl,
+    llmModel,
+    llmMode,
+    llmStatus,
+    setScenes,
+    setSelectedSceneId,
+    setCurrentProject,
+    setView,
+    pushEditLog,
   } = useStore();
 
   const [items, setItems] = useState<MediaFileEntry[]>([]);
@@ -2976,9 +3437,20 @@ function MediaLibraryModal({ darkMode, onClose }: { darkMode: boolean; onClose: 
   const [applyingPath, setApplyingPath] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [filter, setFilter] = useState<'all' | 'image' | 'video'>('all');
+  // 여러 개 선택 모드: 선택한 순서대로 AI가 한 번에 스토리보드를 만들어줍니다.
+  const [multiSelect, setMultiSelect] = useState(false);
+  const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
+  const [building, setBuilding] = useState(false);
+  const [buildStage, setBuildStage] = useState('');
   // 생성한 objectURL을 모두 누적해두었다가, 모달이 닫힐 때 한 번에 정리합니다.
   // (state를 클로저로 참조하면 마지막 값이 아닌 최초 렌더 시점 값을 참조하게 되므로 ref를 사용합니다)
   const createdUrlsRef = useRef<string[]>([]);
+  // 2026-07-23 버그 수정: 예전에는 위 createdUrlsRef의 URL을 모달이 닫힐 때 무조건 전부
+  // revoke했는데, 그중에는 이미 장면에 적용되어 계속 써야 하는 URL도 섞여 있어 모달을
+  // 닫으면 방금 적용한 사진이 깨지는 문제가 있었습니다. 실제로 장면(store)에 적용되었거나
+  // 새 스토리보드에 쓰인 URL은 여기 표시해두고, 모달이 닫힐 때 이 목록에 있는 URL은
+  // revoke하지 않습니다 (썸네일 전용으로만 쓰인 URL만 정리합니다).
+  const appliedUrlsRef = useRef<Set<string>>(new Set());
 
   const selectedScene = scenes.find((s) => s.id === selectedSceneId) ?? scenes[0] ?? null;
 
@@ -3028,9 +3500,12 @@ function MediaLibraryModal({ darkMode, onClose }: { darkMode: boolean; onClose: 
   }, [mediaDirHandle]);
 
   useEffect(() => {
-    // 모달이 닫힐 때(언마운트 시) 그동안 생성해둔 objectURL을 모두 정리합니다.
+    // 모달이 닫힐 때(언마운트 시) 그동안 생성해둔 objectURL 중, 실제로 장면에 적용되지 않고
+    // 썸네일로만 쓰인 것들만 정리합니다 (적용된 URL을 지우면 방금 고른 사진/영상이 깨집니다).
     return () => {
-      createdUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+      createdUrlsRef.current.forEach((url) => {
+        if (!appliedUrlsRef.current.has(url)) URL.revokeObjectURL(url);
+      });
       createdUrlsRef.current = [];
     };
   }, []);
@@ -3046,6 +3521,12 @@ function MediaLibraryModal({ darkMode, onClose }: { darkMode: boolean; onClose: 
   };
 
   const handleApply = async (entry: MediaFileEntry) => {
+    if (multiSelect) {
+      setSelectedPaths((prev) =>
+        prev.includes(entry.path) ? prev.filter((p) => p !== entry.path) : [...prev, entry.path]
+      );
+      return;
+    }
     if (!selectedScene) {
       setErrorMsg('먼저 편집기에서 장면을 선택해주세요.');
       return;
@@ -3058,6 +3539,7 @@ function MediaLibraryModal({ darkMode, onClose }: { darkMode: boolean; onClose: 
           url = await fileHandleToObjectUrl(entry.handle);
           createdUrlsRef.current.push(url);
         }
+        appliedUrlsRef.current.add(url);
         applyImageToScene(selectedScene.id, url, {
           localImageName: entry.name,
           logMessage: `"${selectedScene.customTitle}" 장면에 로컬 이미지 적용: ${entry.name}`,
@@ -3070,6 +3552,93 @@ function MediaLibraryModal({ darkMode, onClose }: { darkMode: boolean; onClose: 
       setErrorMsg('미디어를 적용하는 중 문제가 발생했습니다.');
     } finally {
       setApplyingPath(null);
+    }
+  };
+
+  const toggleMultiSelect = () => {
+    setMultiSelect((v) => !v);
+    setSelectedPaths([]);
+    setErrorMsg(null);
+  };
+
+  /**
+   * 사용자가 순서대로 고른 사진/영상으로 AI가 스토리보드를 만듭니다. 채팅으로 먼저
+   * 컨셉을 정하는 방식과 달리, 선택한 미디어 "그대로" 순서를 유지한 채 한 장면씩
+   * 나레이션/대사를 붙입니다. 결과는 새 프로젝트로 편집기에 바로 열립니다.
+   */
+  const handleBuildStoryboardFromMedia = async () => {
+    if (building || selectedPaths.length === 0) return;
+    if (llmStatus === 'offline') {
+      setErrorMsg('AI(LM Studio)가 연결되어 있지 않습니다. 헤더의 "설정"에서 먼저 연결해주세요.');
+      return;
+    }
+    setBuilding(true);
+    setErrorMsg(null);
+    try {
+      const orderedEntries = selectedPaths
+        .map((p) => items.find((i) => i.path === p))
+        .filter((e): e is MediaFileEntry => Boolean(e));
+
+      setBuildStage('선택한 사진/영상에 어울리는 나레이션을 작성하는 중...');
+      const descriptors: MediaDescriptor[] = orderedEntries.map((entry) => ({
+        label: entry.name,
+        kind: entry.kind,
+      }));
+      const written = await generateStoryboardFromMedia({
+        items: descriptors,
+        settings: { baseUrl: llmBaseUrl, model: llmModel, mode: llmMode },
+      });
+
+      setBuildStage('사진·영상 파일을 장면에 연결하는 중...');
+      const newScenes: Scene[] = await Promise.all(
+        orderedEntries.map(async (entry, i) => {
+          const base = written[i];
+          if (entry.kind === 'video') {
+            const url = await fileHandleToObjectUrl(entry.handle);
+            createdUrlsRef.current.push(url);
+            appliedUrlsRef.current.add(url);
+            return {
+              id: genId('scene'),
+              ...base,
+              photoRef: '',
+              localVideoName: entry.name,
+              localVideoUrl: url,
+            } satisfies Scene;
+          }
+          let url = thumbUrls[entry.path];
+          if (!url) {
+            url = await fileHandleToObjectUrl(entry.handle);
+            createdUrlsRef.current.push(url);
+          }
+          appliedUrlsRef.current.add(url);
+          return {
+            id: genId('scene'),
+            ...base,
+            photoRef: url,
+            localImageName: entry.name,
+          } satisfies Scene;
+        })
+      );
+
+      setScenes(newScenes);
+      setSelectedSceneId(newScenes[0]?.id ?? null);
+      const now = new Date().toISOString();
+      setCurrentProject({
+        id: genId('proj'),
+        name: newScenes[0]?.customTitle ? `${newScenes[0].customTitle} 외 ${newScenes.length - 1}개 장면` : '새 스토리보드',
+        folderPath: '',
+        createdAt: now,
+        modifiedAt: now,
+        scenes: newScenes,
+      });
+      pushEditLog('storyboard_generate', `미디어 라이브러리에서 선택한 사진·영상 ${newScenes.length}개로 스토리보드 생성`);
+      setView('editor');
+      onClose();
+    } catch (err: any) {
+      setErrorMsg(`스토리보드를 만드는 중 문제가 발생했습니다: ${err?.message ?? '알 수 없는 오류'}`);
+    } finally {
+      setBuilding(false);
+      setBuildStage('');
     }
   };
 
@@ -3090,10 +3659,31 @@ function MediaLibraryModal({ darkMode, onClose }: { darkMode: boolean; onClose: 
         </div>
 
         <div className="px-6 py-3 border-b shrink-0 flex flex-wrap items-center gap-2 text-xs" style={{ borderColor: darkMode ? '#262626' : '#e5e5e5' }}>
-          <span className={cn(darkMode ? 'text-neutral-400' : 'text-neutral-500')}>
-            적용 대상:{' '}
-            <span className="font-semibold text-indigo-500">{selectedScene ? selectedScene.customTitle : '선택된 장면 없음'}</span>
-          </span>
+          {multiSelect ? (
+            <span className={cn(darkMode ? 'text-neutral-400' : 'text-neutral-500')}>
+              고른 순서대로 <span className="font-semibold text-emerald-500">{selectedPaths.length}개</span> 선택됨 — AI가 순서 그대로 스토리보드를 만듭니다
+            </span>
+          ) : (
+            <span className={cn(darkMode ? 'text-neutral-400' : 'text-neutral-500')}>
+              적용 대상:{' '}
+              <span className="font-semibold text-indigo-500">{selectedScene ? selectedScene.customTitle : '선택된 장면 없음'}</span>
+            </span>
+          )}
+          <button
+            onClick={toggleMultiSelect}
+            className={cn(
+              'flex items-center gap-1.5 font-medium px-2.5 py-1 rounded-md transition-colors',
+              multiSelect
+                ? 'bg-emerald-600 text-white hover:bg-emerald-700'
+                : darkMode
+                ? 'bg-neutral-800 text-neutral-300 hover:text-white'
+                : 'bg-neutral-100 text-neutral-600 hover:text-neutral-900'
+            )}
+            title="여러 개를 골라 한 번에 AI 스토리보드를 만듭니다"
+          >
+            {multiSelect ? <CheckSquare className="w-3.5 h-3.5" /> : <Images className="w-3.5 h-3.5" />}
+            {multiSelect ? '여러 개 선택 중' : '여러 개 선택해서 AI로 만들기'}
+          </button>
           <div className="flex-1" />
           {mediaDirHandle ? (
             <span className="flex items-center gap-1.5 text-emerald-500">
@@ -3153,38 +3743,62 @@ function MediaLibraryModal({ darkMode, onClose }: { darkMode: boolean; onClose: 
                 ))}
               </div>
               <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
-                {filteredItems.map((entry) => (
-                  <button
-                    key={entry.path}
-                    onClick={() => handleApply(entry)}
-                    disabled={applyingPath === entry.path}
-                    className={cn(
-                      'group relative aspect-video rounded-xl overflow-hidden border transition-all disabled:opacity-60',
-                      darkMode ? 'border-neutral-800 hover:border-indigo-500' : 'border-neutral-200 hover:border-indigo-400'
-                    )}
-                  >
-                    {entry.kind === 'image' && thumbUrls[entry.path] ? (
-                      <img src={thumbUrls[entry.path]} alt={entry.name} className="w-full h-full object-cover" />
-                    ) : (
-                      <div className={cn('w-full h-full flex flex-col items-center justify-center gap-1', darkMode ? 'bg-neutral-800' : 'bg-neutral-100')}>
-                        <Video className={cn('w-6 h-6', darkMode ? 'text-neutral-500' : 'text-neutral-400')} />
-                        <span className={cn('text-[10px]', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>영상</span>
-                      </div>
-                    )}
-                    <div className="absolute inset-x-0 bottom-0 bg-black/60 px-1.5 py-1">
-                      <p className="text-[10px] text-white truncate">{entry.path}</p>
-                    </div>
-                    <div className="absolute inset-0 flex items-center justify-center bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity">
-                      {applyingPath === entry.path ? (
-                        <Loader2 className="w-5 h-5 text-white animate-spin" />
-                      ) : (
-                        <span className="text-white text-xs font-medium bg-indigo-600 px-2.5 py-1 rounded-full">
-                          이 장면에 적용
-                        </span>
+                {filteredItems.map((entry) => {
+                  const selectionIndex = selectedPaths.indexOf(entry.path);
+                  const isSelected = selectionIndex !== -1;
+                  return (
+                    <button
+                      key={entry.path}
+                      onClick={() => handleApply(entry)}
+                      disabled={applyingPath === entry.path}
+                      className={cn(
+                        'group relative aspect-video rounded-xl overflow-hidden border transition-all disabled:opacity-60',
+                        isSelected
+                          ? 'border-emerald-500 ring-2 ring-emerald-500/40'
+                          : darkMode
+                          ? 'border-neutral-800 hover:border-indigo-500'
+                          : 'border-neutral-200 hover:border-indigo-400'
                       )}
-                    </div>
-                  </button>
-                ))}
+                    >
+                      {entry.kind === 'image' && thumbUrls[entry.path] ? (
+                        <img src={thumbUrls[entry.path]} alt={entry.name} className="w-full h-full object-cover" />
+                      ) : entry.kind === 'video' ? (
+                        <div className={cn('w-full h-full flex flex-col items-center justify-center gap-1', darkMode ? 'bg-neutral-800' : 'bg-neutral-100')}>
+                          <Video className={cn('w-6 h-6', darkMode ? 'text-neutral-500' : 'text-neutral-400')} />
+                          <span className={cn('text-[10px]', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>영상</span>
+                        </div>
+                      ) : (
+                        <div className={cn('w-full h-full flex flex-col items-center justify-center gap-1', darkMode ? 'bg-neutral-800' : 'bg-neutral-100')}>
+                          <ImageOff className={cn('w-6 h-6', darkMode ? 'text-neutral-500' : 'text-neutral-400')} />
+                          <span className={cn('text-[10px]', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>불러오는 중</span>
+                        </div>
+                      )}
+                      <div className="absolute inset-x-0 bottom-0 bg-black/60 px-1.5 py-1">
+                        <p className="text-[10px] text-white truncate">{entry.path}</p>
+                      </div>
+                      {multiSelect ? (
+                        <div
+                          className={cn(
+                            'absolute top-1.5 left-1.5 w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold border-2',
+                            isSelected ? 'bg-emerald-600 text-white border-white' : 'bg-black/40 text-white/80 border-white/60'
+                          )}
+                        >
+                          {isSelected ? selectionIndex + 1 : ''}
+                        </div>
+                      ) : (
+                        <div className="absolute inset-0 flex items-center justify-center bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity">
+                          {applyingPath === entry.path ? (
+                            <Loader2 className="w-5 h-5 text-white animate-spin" />
+                          ) : (
+                            <span className="text-white text-xs font-medium bg-indigo-600 px-2.5 py-1 rounded-full">
+                              이 장면에 적용
+                            </span>
+                          )}
+                        </div>
+                      )}
+                    </button>
+                  );
+                })}
               </div>
             </>
           )}
@@ -3196,6 +3810,35 @@ function MediaLibraryModal({ darkMode, onClose }: { darkMode: boolean; onClose: 
             </div>
           )}
         </div>
+
+        {multiSelect && (
+          <div
+            className={cn(
+              'shrink-0 flex items-center justify-between gap-3 px-6 py-3 border-t',
+              darkMode ? 'border-neutral-800 bg-neutral-900/60' : 'border-neutral-200 bg-neutral-50'
+            )}
+          >
+            <span className={cn('text-xs', darkMode ? 'text-neutral-400' : 'text-neutral-500')}>
+              {building ? buildStage || 'AI가 스토리보드를 만드는 중...' : `${selectedPaths.length}개 선택됨`}
+            </span>
+            <button
+              onClick={handleBuildStoryboardFromMedia}
+              disabled={building || selectedPaths.length === 0 || llmStatus === 'offline'}
+              title={llmStatus === 'offline' ? 'AI(LM Studio) 연결이 필요합니다' : undefined}
+              className={cn(
+                'flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-colors',
+                building || selectedPaths.length === 0 || llmStatus === 'offline'
+                  ? darkMode
+                    ? 'bg-neutral-800 text-neutral-600 cursor-not-allowed'
+                    : 'bg-neutral-200 text-neutral-400 cursor-not-allowed'
+                  : 'bg-emerald-600 text-white hover:bg-emerald-700'
+              )}
+            >
+              {building ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wand2 className="w-4 h-4" />}
+              AI로 스토리보드 만들기
+            </button>
+          </div>
+        )}
       </div>
     </ModalBackdrop>
   );

@@ -1,0 +1,64 @@
+[
+  {
+    "id": "m_001",
+    "postId": "20260710_093000",
+    "url": "/api/uploads/2026/07/jeju_hyeopjae_beach.jpg",
+    "type": "image",
+    "order": 0,
+    "caption": "협재 해변 도착 — 에메랄드빛 바다",
+    "location": "제주 협재해수욕장",
+    "year": 2026,
+    "month": "07",
+    "day": "10",
+    "isThumbnail": true
+  },
+  {
+    "id": "m_002",
+    "postId": "20260710_093000",
+    "url": "/api/uploads/2026/07/jeju_hyeopjae_kids.jpg",
+    "type": "image",
+    "order": 1,
+    "caption": "모래사장에서 조개 줍는 아이들",
+    "location": "제주 협재해수욕장",
+    "year": 2026,
+    "month": "07",
+    "day": "10"
+  },
+  {
+    "id": "m_003",
+    "postId": "20260710_093000",
+    "url": "/api/uploads/2026/07/jeju_hyeopjae_drone.mp4",
+    "type": "video",
+    "order": 2,
+    "caption": "드론으로 담은 협재 해변 전경",
+    "location": "제주 협재해수욕장",
+    "year": 2026,
+    "month": "07",
+    "day": "10"
+  },
+  {
+    "id": "m_004",
+    "postId": "20260711_101500",
+    "url": "/api/uploads/2026/07/jeju_saebyeol_oreum.jpg",
+    "type": "image",
+    "order": 0,
+    "caption": "새별오름 정상에서 본 풍경",
+    "location": "제주 새별오름",
+    "year": 2026,
+    "month": "07",
+    "day": "11",
+    "isThumbnail": true
+  },
+  {
+    "id": "m_005",
+    "postId": "20260711_101500",
+    "url": "/api/uploads/2026/07/jeju_cafe_hallabong.jpg",
+    "type": "image",
+    "order": 1,
+    "caption": "감귤 에이드로 더위를 식힌 감성 카페",
+    "location": "새별오름 근처 카페",
+    "year": 2026,
+    "month": "07",
+    "day": "11"
+  }
+]

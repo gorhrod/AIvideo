@@ -14,6 +14,12 @@ import {
   readJsonFile,
   findMediaFileByName,
   fileHandleToObjectUrl,
+  getOpfsRoot,
+  rememberDirectoryHandle,
+  getRememberedDirectoryHandle,
+  forgetRememberedDirectoryHandle,
+  queryPermissionSilently,
+  REMEMBERED_SAVE_DIR_KEY,
   type MediaFileEntry,
 } from '@/lib/fsAccess';
 import { readBlogData, type BlogPost, type BlogMediaMeta, type BlogCategory } from '@/lib/blogData';
@@ -52,6 +58,8 @@ export type ViewState = 'chat' | 'editor';
 export type ModalState = null | 'new-project' | 'load' | 'export' | 'media' | 'settings' | 'blog-import';
 
 export type LlmStatus = 'unknown' | 'checking' | 'online' | 'offline';
+/** 빠른모드: 속도 위주(짧은 생성, 응답이 가장 빠름) · 보통모드: 가성비(기본값) · 전문가모드: 토큰을 많이 써서 더 길고 자세한 결과 */
+export type LlmMode = 'fast' | 'normal' | 'expert';
 
 export interface ChatMessage {
   id: string;
@@ -234,13 +242,27 @@ interface AppState {
   editLog: EditLogEntry[];
   pushEditLog: (type: string, message: string) => void;
 
+  /** 현재 편집 중인 스토리보드를 완전히 비우고 처음(0)부터 새로 시작합니다 ("새 프로젝트"용). */
+  resetForNewProject: () => void;
+
   saveDirHandle: any | null;
   saveDirName: string | null;
+  /** 저장 폴더가 사용자가 직접 고른 실제 폴더인지('external'), 폴더를 아직 안 골라 브라우저
+   *  내부 자동 저장소(OPFS)를 쓰고 있는지('opfs')를 나타냅니다. */
+  saveDirSource: 'external' | 'opfs' | null;
+  /** 이전에 연결했던 실제 저장 폴더 이름 (기억은 하고 있지만 아직 이번 세션에 권한이 재확인되지
+   *  않은 상태 — 사용자가 클릭해서 재연결하도록 안내할 때 사용). */
+  rememberedSaveDirName: string | null;
   autoSaveEnabled: boolean;
   setAutoSaveEnabled: (v: boolean) => void;
   saveStatus: SaveStatus;
   saveError: string | null;
   lastSavedAt: string | null;
+  /** 앱 시작 시 1회 호출: 기억해둔 저장 폴더에 조용히 재연결을 시도하고, 실패하면 브라우저
+   *  내부 자동 저장소(OPFS)로 자동 연결해 폴더가 전혀 없어도 바로 자동저장이 되도록 합니다. */
+  initStorage: () => Promise<void>;
+  /** 기억해둔 저장 폴더에 사용자 클릭(제스처)으로 다시 연결합니다 (권한 재요청 다이얼로그 가능). */
+  reconnectRememberedSaveFolder: () => Promise<{ ok: boolean; message?: string }>;
   connectSaveFolder: () => Promise<{ ok: boolean; message?: string }>;
   disconnectSaveFolder: () => void;
   saveAllToFolder: (opts?: { silent?: boolean }) => Promise<{ ok: boolean; message?: string }>;
@@ -276,9 +298,10 @@ interface AppState {
   setLlmStatus: (v: LlmStatus) => void;
   llmAvailableModels: string[];
   setLlmAvailableModels: (v: string[]) => void;
+  /** AI 응답 속도/품질 모드: 빠른모드(속도 위주) · 보통모드(가성비) · 전문가모드(토큰 많이 써서 품질 위주) */
+  llmMode: LlmMode;
+  setLlmMode: (v: LlmMode) => void;
 
-  ffmpegPathOverride: string;
-  setFfmpegPathOverride: (v: string) => void;
   subtitleFontName: string;
   setSubtitleFontName: (v: string) => void;
 }
@@ -303,8 +326,97 @@ export const useStore = create<AppState>((set, get) => {
     }));
   };
 
+  /**
+   * 저장 폴더 핸들(사용자가 고른 실제 폴더든, OPFS 자동 저장소든)을 연결하고 그 안의
+   * 이전 저장 내용을 복원합니다. connectSaveFolder(수동 연결)와 initStorage(자동 연결)가
+   * 이 로직을 공유합니다.
+   */
+  const attachSaveDir = async (
+    handle: any,
+    source: 'external' | 'opfs',
+    displayName: string
+  ): Promise<{ ok: boolean; message?: string }> => {
+    try {
+      const dataDir = await getDataDir(handle);
+
+      const [appState, chatData, logData] = await Promise.all([
+        readJsonFileIfExists(dataDir, APP_STATE_FILE),
+        readJsonFileIfExists(dataDir, CHAT_HISTORY_FILE),
+        readJsonFileIfExists(dataDir, EDIT_LOG_FILE),
+      ]);
+
+      if (source === 'external') {
+        const existingReadme = await readTextFileIfExists(handle, README_FILE);
+        if (existingReadme === null) {
+          await writeTextFile(handle, README_FILE, README_CONTENT);
+        }
+      }
+
+      set({
+        saveDirHandle: handle,
+        saveDirName: displayName,
+        saveDirSource: source,
+        saveStatus: 'idle',
+        saveError: null,
+      });
+
+      if (appState && Array.isArray(appState.scenes) && appState.scenes.length > 0) {
+        set({
+          scenes: appState.scenes,
+          darkMode: typeof appState.darkMode === 'boolean' ? appState.darkMode : get().darkMode,
+          selectedSceneId: appState.selectedSceneId ?? appState.scenes[0]?.id ?? null,
+          llmBaseUrl: typeof appState.llmBaseUrl === 'string' && appState.llmBaseUrl ? appState.llmBaseUrl : get().llmBaseUrl,
+          llmModel: typeof appState.llmModel === 'string' && appState.llmModel ? appState.llmModel : get().llmModel,
+          llmMode: appState.llmMode === 'fast' || appState.llmMode === 'normal' || appState.llmMode === 'expert' ? appState.llmMode : get().llmMode,
+          subtitleFontName: typeof appState.subtitleFontName === 'string' ? appState.subtitleFontName : get().subtitleFontName,
+          view: 'editor',
+        });
+        if (appState.currentProjectMeta) {
+          set((s) => ({
+            currentProject: {
+              ...appState.currentProjectMeta,
+              scenes: s.scenes,
+            },
+          }));
+        }
+      }
+      if (chatData && Array.isArray(chatData.messages) && chatData.messages.length > 0) {
+        set({ chatMessages: chatData.messages });
+      }
+      if (logData && Array.isArray(logData.entries)) {
+        set({ editLog: logData.entries });
+      }
+
+      addLogEntry(
+        'folder_connect',
+        source === 'external'
+          ? `저장 폴더 연결됨: "${displayName}"`
+          : '브라우저 내부 자동 저장소에 연결됨 (실제 폴더를 아직 연결하지 않음)'
+      );
+
+      const restored = Boolean(appState || chatData);
+      return {
+        ok: true,
+        message:
+          source === 'external'
+            ? restored
+              ? `"${displayName}" 폴더에서 이전 저장 내용을 불러왔습니다.`
+              : `"${displayName}" 폴더에 새로 연결되었습니다.`
+            : restored
+              ? '이전 자동저장 내용을 불러왔습니다. (저장 폴더를 연결하면 실제 폴더에 저장됩니다)'
+              : '저장 폴더가 없어 브라우저 내부 저장소에 자동 저장을 시작합니다. 언제든 "저장 폴더 연결"로 실제 폴더로 옮길 수 있습니다.',
+      };
+    } catch (err: any) {
+      console.error(err);
+      return { ok: false, message: '폴더를 여는 중 문제가 발생했습니다.' };
+    }
+  };
+
   return {
-    view: 'editor',
+    // 2026-07-25: 처음 실행하거나(yarn start) 새 프로젝트를 만들었을 때 항상 빈 스토리보드에서
+    // 시작하도록, 초기 view는 채팅 화면(view: 'chat')으로 둡니다. 샘플 씬(SAMPLE_SCENES)은
+    // 더 이상 기본값으로 쓰지 않고, "불러오기" 모달의 "샘플 프로젝트" 섹션에서만 사용합니다.
+    view: 'chat',
     setView: (view) => set({ view }),
     modal: null,
     setModal: (modal) => set({ modal }),
@@ -315,7 +427,7 @@ export const useStore = create<AppState>((set, get) => {
       scheduleAutosave();
     },
 
-    scenes: SAMPLE_SCENES,
+    scenes: [],
     setScenes: (scenes) => set({ scenes }),
     updateScene: (id, updates) => {
       set((s) => ({ scenes: s.scenes.map((sc) => (sc.id === id ? { ...sc, ...updates } : sc)) }));
@@ -380,13 +492,24 @@ export const useStore = create<AppState>((set, get) => {
       scheduleAutosave();
     },
 
-    selectedSceneId: 'scene_001',
+    selectedSceneId: null,
     setSelectedSceneId: (id) => set({ selectedSceneId: id }),
 
-    currentProject: SAMPLE_PROJECT,
+    currentProject: null,
     setCurrentProject: (project) => set({ currentProject: project, scenes: project?.scenes ?? [] }),
     savedProjects: SAMPLE_PROJECTS,
     setSavedProjects: (projects) => set({ savedProjects: projects }),
+
+    resetForNewProject: () => {
+      set({
+        scenes: [],
+        selectedSceneId: null,
+        currentProject: null,
+        chatMessages: [INITIAL_CHAT_MESSAGE],
+      });
+      addLogEntry('new_project', '새 프로젝트 시작 (빈 스토리보드에서 0부터 다시 시작)');
+      scheduleAutosave();
+    },
 
     chatMessages: [INITIAL_CHAT_MESSAGE],
     addChatMessage: (role, text) => {
@@ -406,11 +529,50 @@ export const useStore = create<AppState>((set, get) => {
 
     saveDirHandle: null,
     saveDirName: null,
+    saveDirSource: null,
+    rememberedSaveDirName: null,
     autoSaveEnabled: true,
     setAutoSaveEnabled: (v) => set({ autoSaveEnabled: v }),
     saveStatus: 'idle',
     saveError: null,
     lastSavedAt: null,
+
+    initStorage: async () => {
+      if (get().saveDirHandle) return; // 이미 이번 세션에 연결됨
+      try {
+        const remembered = await getRememberedDirectoryHandle(REMEMBERED_SAVE_DIR_KEY);
+        if (remembered) {
+          set({ rememberedSaveDirName: remembered.name ?? null });
+          // 사용자 제스처 없이 조용히 권한만 확인합니다 (다이얼로그 없음). 이미 허용되어 있으면
+          // 바로 재연결하고, 아니면 StorageBar에 "다시 연결" 안내를 띄웁니다.
+          const alreadyGranted = await queryPermissionSilently(remembered, 'readwrite');
+          if (alreadyGranted) {
+            const res = await attachSaveDir(remembered, 'external', remembered.name ?? '저장 폴더');
+            if (res.ok) return;
+          }
+        }
+      } catch (err) {
+        console.error(err);
+      }
+      // 기억해둔 폴더가 없거나 조용히 재연결하지 못했으면, 폴더 선택 없이도 바로 자동저장이
+      // 되도록 브라우저 내부 자동 저장소(OPFS)에 연결합니다.
+      try {
+        const opfsRoot = await getOpfsRoot();
+        if (opfsRoot) {
+          await attachSaveDir(opfsRoot, 'opfs', '자동 저장소 (브라우저 내부)');
+        }
+      } catch (err) {
+        console.error(err);
+      }
+    },
+
+    reconnectRememberedSaveFolder: async () => {
+      const remembered = await getRememberedDirectoryHandle(REMEMBERED_SAVE_DIR_KEY);
+      if (!remembered) return { ok: false, message: '기억된 저장 폴더가 없습니다.' };
+      const granted = await verifyPermission(remembered, 'readwrite');
+      if (!granted) return { ok: false, message: '폴더 쓰기 권한이 거부되었습니다.' };
+      return attachSaveDir(remembered, 'external', remembered.name ?? '저장 폴더');
+    },
 
     connectSaveFolder: async () => {
       const handle = await pickDirectory('readwrite');
@@ -421,61 +583,13 @@ export const useStore = create<AppState>((set, get) => {
         return { ok: false, message: '폴더 쓰기 권한이 거부되었습니다.' };
       }
 
-      try {
-        const dataDir = await getDataDir(handle);
-
-        const [appState, chatData, logData] = await Promise.all([
-          readJsonFileIfExists(dataDir, APP_STATE_FILE),
-          readJsonFileIfExists(dataDir, CHAT_HISTORY_FILE),
-          readJsonFileIfExists(dataDir, EDIT_LOG_FILE),
-        ]);
-
-        const existingReadme = await readTextFileIfExists(handle, README_FILE);
-        if (existingReadme === null) {
-          await writeTextFile(handle, README_FILE, README_CONTENT);
-        }
-
-        set({ saveDirHandle: handle, saveDirName: handle.name, saveStatus: 'idle', saveError: null });
-
-        if (appState && Array.isArray(appState.scenes) && appState.scenes.length > 0) {
-          set({
-            scenes: appState.scenes,
-            darkMode: typeof appState.darkMode === 'boolean' ? appState.darkMode : get().darkMode,
-            selectedSceneId: appState.selectedSceneId ?? appState.scenes[0]?.id ?? null,
-            llmBaseUrl: typeof appState.llmBaseUrl === 'string' && appState.llmBaseUrl ? appState.llmBaseUrl : get().llmBaseUrl,
-            llmModel: typeof appState.llmModel === 'string' && appState.llmModel ? appState.llmModel : get().llmModel,
-            ffmpegPathOverride: typeof appState.ffmpegPathOverride === 'string' ? appState.ffmpegPathOverride : get().ffmpegPathOverride,
-            subtitleFontName: typeof appState.subtitleFontName === 'string' ? appState.subtitleFontName : get().subtitleFontName,
-          });
-          if (appState.currentProjectMeta) {
-            set((s) => ({
-              currentProject: {
-                ...appState.currentProjectMeta,
-                scenes: s.scenes,
-              },
-            }));
-          }
-        }
-        if (chatData && Array.isArray(chatData.messages) && chatData.messages.length > 0) {
-          set({ chatMessages: chatData.messages });
-        }
-        if (logData && Array.isArray(logData.entries)) {
-          set({ editLog: logData.entries });
-        }
-
-        addLogEntry('folder_connect', `저장 폴더 연결됨: "${handle.name}"`);
-
-        const restored = Boolean(appState || chatData);
-        return {
-          ok: true,
-          message: restored
-            ? `"${handle.name}" 폴더에서 이전 저장 내용을 불러왔습니다.`
-            : `"${handle.name}" 폴더에 새로 연결되었습니다.`,
-        };
-      } catch (err: any) {
-        console.error(err);
-        return { ok: false, message: '폴더를 여는 중 문제가 발생했습니다.' };
+      const res = await attachSaveDir(handle, 'external', handle.name);
+      if (res.ok) {
+        // 다음 방문 때 "마지막에 저장한 폴더"로 자동 재연결을 시도할 수 있도록 기억해둡니다.
+        rememberDirectoryHandle(REMEMBERED_SAVE_DIR_KEY, handle).catch((err) => console.error(err));
+        set({ rememberedSaveDirName: handle.name });
       }
+      return res;
     },
 
     disconnectSaveFolder: () => {
@@ -483,7 +597,7 @@ export const useStore = create<AppState>((set, get) => {
         clearTimeout(autosaveTimer);
         autosaveTimer = null;
       }
-      set({ saveDirHandle: null, saveDirName: null, saveStatus: 'idle', saveError: null });
+      set({ saveDirHandle: null, saveDirName: null, saveDirSource: null, saveStatus: 'idle', saveError: null });
     },
 
     saveAllToFolder: async (opts) => {
@@ -519,7 +633,7 @@ export const useStore = create<AppState>((set, get) => {
           mediaDirName: state.mediaDirName,
           llmBaseUrl: state.llmBaseUrl,
           llmModel: state.llmModel,
-          ffmpegPathOverride: state.ffmpegPathOverride,
+          llmMode: state.llmMode,
           subtitleFontName: state.subtitleFontName,
         };
         const chatPayload = { version: 1, updatedAt: now, messages: state.chatMessages };
@@ -748,12 +862,12 @@ export const useStore = create<AppState>((set, get) => {
     setLlmStatus: (v) => set({ llmStatus: v }),
     llmAvailableModels: [],
     setLlmAvailableModels: (v) => set({ llmAvailableModels: v }),
-
-    ffmpegPathOverride: '',
-    setFfmpegPathOverride: (v) => {
-      set({ ffmpegPathOverride: v });
+    llmMode: 'normal',
+    setLlmMode: (v) => {
+      set({ llmMode: v });
       scheduleAutosave();
     },
+
     subtitleFontName: '',
     setSubtitleFontName: (v) => {
       set({ subtitleFontName: v });

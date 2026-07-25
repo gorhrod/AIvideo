@@ -1,0 +1,5 @@
+[
+  { "id": "travel", "name": "여행", "color": "#0ea5e9" },
+  { "id": "daily", "name": "일상", "color": "#f59e0b" },
+  { "id": "food", "name": "음식", "color": "#ef4444" }
+]

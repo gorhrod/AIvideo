@@ -1,0 +1,38 @@
+[
+  {
+    "id": "20260710_093000",
+    "title": "제주 여행 1일차 - 협재 해변",
+    "content": "<p>드디어 제주도 도착! 짐을 풀자마자 협재 해변부터 달려갔다.</p><img src=\"/api/uploads/2026/07/jeju_hyeopjae_beach.jpg\" data-media-id=\"m_001\" data-thumbnail=\"true\"><p>에메랄드빛 바다에 다들 눈이 휘둥그레졌다. 아이들은 신발을 벗자마자 바로 모래사장으로 달려갔다.</p><img src=\"/api/uploads/2026/07/jeju_hyeopjae_kids.jpg\" data-media-id=\"m_002\"><p>드론을 띄워서 해변 전체를 담아봤다. 하늘에서 보니 색이 더 예뻤다.</p><video src=\"/api/uploads/2026/07/jeju_hyeopjae_drone.mp4\" data-media-id=\"m_003\"></video><p>내일은 오름에 오르기로 했다.</p>",
+    "author": "gyeongwoo",
+    "createdAt": "2026-07-10T00:30:00.000Z",
+    "updatedAt": "2026-07-10T00:52:00.000Z",
+    "category": "travel",
+    "tags": ["제주", "여행", "협재해변", "가족여행"],
+    "mediaUrls": [],
+    "location": "제주 협재해수욕장"
+  },
+  {
+    "id": "20260711_101500",
+    "title": "제주 여행 2일차 - 새별오름과 감성 카페",
+    "content": "<p>둘째 날은 새별오름 하이킹으로 시작했다. 생각보다 가팔라서 다들 숨이 찼지만 정상에서 본 풍경이 그 값을 했다.</p><img src=\"/api/uploads/2026/07/jeju_saebyeol_oreum.jpg\" data-media-id=\"m_004\" data-thumbnail=\"true\"><p>내려오는 길에 근처 감성 카페에 들러 감귤 에이드로 더위를 식혔다.</p><img src=\"/api/uploads/2026/07/jeju_cafe_hallabong.jpg\" data-media-id=\"m_005\"><p>오후엔 숙소에서 푹 쉬었다.</p>",
+    "author": "jungmin",
+    "createdAt": "2026-07-11T01:15:00.000Z",
+    "updatedAt": "2026-07-11T01:40:00.000Z",
+    "category": "travel",
+    "tags": ["제주", "새별오름", "하이킹", "카페"],
+    "mediaUrls": [],
+    "location": "제주 새별오름"
+  },
+  {
+    "id": "20260712_180000",
+    "title": "제주 여행 마지막 날 - 노을과 흑돼지",
+    "content": "<p>여행 마지막 날, 함덕 해변에서 노을을 보기로 했다.</p><img src=\"/api/uploads/2026/07/jeju_sunset_hamdeok.jpg\" title=\"함덕 해변에서 바라본 노을\" data-location=\"제주 함덕해수욕장\" data-thumbnail=\"true\"><p>저녁은 다 같이 흑돼지 구이로 여행을 마무리했다.</p><img src=\"/api/uploads/2026/07/jeju_family_dinner.jpg\" title=\"흑돼지 저녁 식사\" data-location=\"제주시 흑돼지거리\"><p>다음에 또 오자고 약속했다.</p>",
+    "author": "gyeongwoo",
+    "createdAt": "2026-07-12T09:00:00.000Z",
+    "updatedAt": "2026-07-12T09:20:00.000Z",
+    "category": "travel",
+    "tags": ["제주", "노을", "흑돼지", "여행마무리"],
+    "mediaUrls": [],
+    "location": "제주 함덕해수욕장"
+  }
+]
