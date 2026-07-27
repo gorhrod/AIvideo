@@ -450,3 +450,285 @@ Next.js 서버까지 연결한 end-to-end 테스트(`yarn dev` 구동)는 네트
   네트워크가 막힌 샌드박스라 이번에도 `yarn install`/`tsc`는 실행하지 못했고, 수정한 모든
   섹션을 직접 재확인(중괄호/괄호 짝, 타입 필드 존재 여부, 남은 참조 없음)했습니다. 첫 실행
   후 `yarn install && yarn dev`로 정상 빌드되는지 한 번 더 확인해주세요.
+- **2026-07-27**: (참고: 직전 세션 요약에 "system 메시지 병합/빈 응답 처리/폴더 배너/사진
+  업로드를 이미 구현했다"는 내용이 있었지만, 실제 코드(`lib/llm.ts`, `store/useStore.ts`)를
+  확인해보니 전혀 반영되어 있지 않았습니다 — 이번 세션에서 실제로 처음부터 구현했습니다.)
+  사용자가 보고한 문제를 다음과 같이 수정:
+  1) **블로그 가져오기 → 스토리보드 생성 시 LM Studio 400 "Unable to generate parser..."
+     오류** — 원인은 기본 시스템 프롬프트 + 블로그 컨텍스트(+ 대화가 길 때 히스토리 생략
+     안내)까지 system 역할 메시지를 2~3개 함께 보내고 있었기 때문. 일부 로컬 모델
+     (Qwen3.5/3.6 계열 GGUF 양자화 등)의 채팅 템플릿(Jinja)은 system 메시지가 2개 이상이면
+     `raise_exception`으로 강제 실패하는 알려진 LM Studio/llama.cpp 쪽 문제가 있음.
+     `lib/llm.ts`에 `mergeSystemMessages()` 신설, 실제 요청 직전
+     `prepareMessagesForRequest()`(트리밍 + 병합)를 거치도록 `streamChat`/`chatOnce` 수정 —
+     항상 system 메시지 1개만 전송됨. `describeLlmError()`에 이 오류가 계속될 경우를 대비한
+     구체적인 한국어 안내(모델 템플릿 자체 문제일 수 있음, 모델 재로드/다른 모델 사용 권장)
+     추가.
+  2) **채팅에서 "(빈 응답을 받았습니다)" 오류** — 추론(reasoning) 계열 모델이 "생각" 단계에서
+     `max_tokens` 예산을 전부 써버리고 최종 답변(content)을 한 글자도 못 내놓는 경우가
+     원인 중 하나였음. `streamChat`/`chatOnce`가 `finish_reason: 'length'`나
+     reasoning_content만 있고 content가 비어있는 응답을 감지해 구체적인 원인/해결책(전문가
+     모드로 전환, 또는 추론 전용 모델 대신 일반 채팅 모델 사용)을 담은 오류로 던지도록 수정.
+     스트리밍 채팅 기본 `max_tokens`를 700 → 1100으로 상향. `ChatInterface`의 catch 블록이
+     이제 `err.message`를 그대로 보여주도록 수정(예전에는 원인과 무관하게 항상 같은 일반
+     "연결 실패" 문구만 표시).
+  3) **"블로그에서 가져오기" 모달의 "채팅으로 가져오기" 버튼이 화면 전환을 안 함** —
+     `BlogImportModal`의 `handleApply`가 채팅 메시지만 추가하고 `setView('chat')`을 호출하지
+     않아 사용자가 방금 보낸 메시지를 못 보는 문제. `setView('chat')` 호출 추가.
+  4) **채팅에서 저장 폴더 연결 안내** — `ChatInterface`에 `saveDirSource === 'opfs'`(아직
+     실제 폴더를 연결하지 않고 브라우저 내부 임시 저장소만 쓰는 중)일 때 표시되는 배너 신설.
+     기억해둔 폴더가 있으면 "이전 폴더 다시 연결", 없으면 "저장 폴더 연결" 버튼을 보여줌
+     (`connectSaveFolder`/`reconnectRememberedSaveFolder` 재사용).
+  5) **스토리보드 편집기에서 사진/영상 직접 등록** — `SceneEditor`에 "사진 등록"/"영상 등록"
+     버튼(숨은 `<input type="file">` 트리거) 신설. `store/useStore.ts`에
+     `uploadPhotoToScene`/`uploadVideoToScene` 액션 신설 — 저장 폴더가 연결되어 있어야
+     동작하며(없으면 "저장 폴더가 연결되지 않았습니다. 먼저 저장 폴더를 연결해주세요." 안내),
+     선택한 파일을 실제로 `KWJMvideoAI_data/projects/<프로젝트명>/media/` 폴더에 복사해
+     저장합니다 (`lib/fsAccess.ts`에 `getProjectMediaDir`/`writeBinaryFile`/
+     `sanitizeProjectFolderName`/`buildUniqueMediaFileName` 신설). 프로젝트별로 폴더가 나뉘어
+     있어 사용자가 탐색기에서 프로젝트별 사진/영상을 바로 찾아볼 수 있음. `resyncMediaReferences`를
+     확장해 "미디어 폴더" 연결분뿐 아니라 이 프로젝트 media 폴더도 함께 확인하도록 수정하고,
+     `attachSaveDir`에서 앱 상태 복원 직후 자동 호출하도록 해서 폴더를 다시 열었을 때 등록한
+     사진/영상 미리보기가 정상적으로 복원됨. 저장 폴더 README(`README_CONTENT`)에도 이 폴더
+     설명 추가.
+  네트워크가 이번에는 열려 있어 실제로 `npm install` + `npx next build`를 끝까지 실행해
+  검증했습니다 — 타입 검사 포함 빌드 성공(`✓ Compiled successfully`, 4개 페이지 정적 생성
+  성공). 검증 후 `node_modules`/`.next`는 전달용 zip에서 제외했습니다. 다음에 여는 사람은
+  `npm install && npm run dev`(또는 `yarn`)로 실행하면 됩니다.
+
+## 2026-07-27(2) — 사용자 요청 6건 수정
+
+1. **"생각(reasoning) 단계에서 토큰을 다 써버림" / "스토리보드를 만드는 중 문제가 발생했습니다"
+   오류 — 압축 후 재시도로 항상 성공하도록 개선** (`lib/llm.ts`)
+   - `generateJsonWithGuaranteedFallback()` 신설: 1차 시도가 실패하면(토큰 소진, 네트워크
+     오류, JSON 파싱 실패 등 무엇이든) 입력을 압축(캡션/본문을 더 짧게 자르고, 대화 기록을
+     최근 8개로 줄이고, "문자열 안에 줄바꿈 금지" 지침 추가)한 뒤 전문가 모드 수준으로 토큰
+     예산을 늘려 2차 시도. 그래도 실패하면 절대 예외를 던지지 않는 로컬 폴백(장면을 채팅
+     메시지/캡션에서 직접 구성)으로 마무리해 사용자에게는 항상 결과가 돌아가도록 함.
+   - **정상적으로 한 번에 성공하는 대다수의 경우 추가 호출이 전혀 없으므로 속도 저하 없음**
+     (재시도는 실패했을 때만 추가로 발생).
+   - `generateStoryboardFromChat`/`generateStoryboardFromMedia`/`generateStoryboardFromPosts`
+     모두 이 로직으로 교체.
+
+2. **"Expected ',' or '}' after property value in JSON..." 오류 — JSON 파싱 견고화**
+   (`lib/llm.ts`)
+   - `extractJsonArray()`를 3단계 복구 로직으로 교체: ① 있는 그대로 파싱 시도 → ②
+     문자열 값 안의 이스케이프 안 된 개행/탭을 이스케이프 + trailing comma 제거 후 재시도
+     (로컬 모델이 나레이션에 실제 줄바꿈을 그대로 넣어 깨지는 경우가 원인) → ③ 그래도
+     실패하면 문자열 밖에서 중괄호 깊이를 직접 추적해 "온전히 닫힌" 장면 객체만 순서대로
+     건져냄(응답이 토큰 부족으로 중간에 잘려도 이미 완성된 앞쪽 장면은 살아남음).
+
+3. **"미디어 폴더 연결" 개념 완전 제거 → 저장 폴더(자동 저장소 포함)와 통합**
+   (`store/useStore.ts`, `components/AppRoot.tsx`)
+   - `mediaDirHandle`/`mediaDirName`/`connectMediaFolder`/`disconnectMediaFolder`를 전부
+     삭제. 사진/영상은 이제 예외 없이 현재 프로젝트의
+     `KWJMvideoAI_data/projects/<프로젝트명>/media/` 폴더(저장 폴더 하위)에만 저장됨 —
+     별도의 "미디어 폴더"라는 개념 자체가 사라짐. 브라우저 안에는 폴더 "경로"(핸들)만
+     남고 실제 사진/영상 내용은 전부 사용자가 고른 폴더 안에 저장되므로 브라우저 저장
+     용량이 커지지 않음.
+   - `uploadPhotoToScene`/`uploadVideoToScene`/새로 만든 `addFilesToProjectMedia`는
+     이제 OPFS 자동 저장소만으로는 부족하고, `saveDirSource === 'external'`(사용자가
+     실제 폴더를 등록한 상태)일 때만 동작 — 아니면 "실제 저장 폴더를 먼저 등록해야
+     사진/영상을 등록할 수 있습니다" 안내와 함께 거절해, 요청하신 "폴더 등록 안 하면
+     기능을 못 쓰게" 동작을 구현.
+   - `StorageBar`의 "미디어 폴더 연결" 버튼을 제거하고, 저장 폴더 연결 여부에 따라
+     안내 문구만 보여주는 상태 표시로 교체.
+   - `MediaLibraryModal`을 전면 재작업: 이제 `listProjectMediaFiles()`로 프로젝트 media
+     폴더 내용을 그대로 보여주고, "사진/영상 등록" 버튼(파일 선택 → `addFilesToProjectMedia`)
+     으로 새 파일을 그 폴더에 실제로 복사해 라이브러리에 추가. 폴더 미등록 시 안내 화면+
+     "저장 폴더 연결하기" 버튼 표시.
+
+4. **스토리보드 편집기 "비슷한 이미지 추천" — 블로그 사진에서 추천 + 사진 없을 때 아이콘
+   표시** (`components/AppRoot.tsx`)
+   - 기존에는 인터넷 스톡 사진(Unsplash)에서 무작위로 추천했는데, 실제로 가져온 블로그
+     사진 중 이 장면과 어울리는 것을 골라 추천하도록 교체 (`getBlogRecommendationsForScene`
+     — 같은 블로그 글 출처면 가산점, 장면 태그와 사진 캡션/위치/글 제목·태그가 겹치면
+     가산점, 이미 이 장면에 쓰이고 있는 사진 자체는 제외).
+   - 추천할 블로그 사진이 없으면(블로그 폴더 미연결, 사진 자체가 없음, 어울리는 사진
+     없음) 각 칸에 "없음" 아이콘(`ImageOff`)과 안내 문구를 표시 — 무리하게 무관한 스톡
+     사진을 보여주지 않음.
+   - `applyImageToScene`에 `sourcePostId`/`sourceMediaId`를 선택적으로 함께 저장하도록
+     확장해, 추천 이미지를 적용해도 출처 정보가 유지되어 다음 추천 때도 활용됨.
+   - "사진 등록"/"영상 등록" 버튼은 이미 있던 기능(2026-07-27 1차 수정)을 그대로 유지 —
+     사진이 많아져도 파일 선택 UI 자체는 그리드/스크롤 기반이라 문제없이 동작.
+
+5. **프로젝트 불러오기 — 샘플 제거 + 삭제 버튼 + 폴더에서 불러올 때 JSON 대신 카드로 표시**
+   (`components/AppRoot.tsx`, `store/useStore.ts`)
+   - `LoadModal`에서 "샘플 프로젝트(데모)" 섹션을 완전히 제거.
+   - 저장 폴더의 프로젝트 목록 각 항목에 삭제(휴지통) 버튼 추가 → 클릭 시 "삭제 확정/취소"
+     인라인 확인 후 실제 파일 삭제(`deleteNamedProject` 신설, `projects/<파일명>.json`
+     제거).
+   - "다른 폴더에서 불러오기"로 고른 폴더의 `.json` 파일들을 더 이상 파일명 그대로 나열하지
+     않고, 각 파일을 미리 읽어 제목/장면 수/수정일/썸네일이 있는 카드로 예쁘게 보여주도록
+     교체. 프로젝트 형식이 아닌 파일은 "프로젝트 형식이 아닌 파일입니다"로 구분 표시.
+
+6. **헤더 로고 클릭 → 채팅 화면으로 바로 이동** (`components/AppRoot.tsx`)
+   - 헤더의 "KWJMvideoAI" 로고를 `<button>`으로 바꾸고 클릭 시 `setView('chat')` 호출.
+
+이번에도 네트워크가 열려 있어 `npm install` → `./node_modules/.bin/tsc --noEmit`(오류 0건)
+→ `npx next build`(`✓ Compiled successfully`, 4개 페이지 정적 생성 성공)까지 끝까지 돌려
+검증했습니다. 검증 후 생성된 `node_modules`/`.next`/`package-lock.json`/
+`tsconfig.tsbuildinfo`는 전달용 zip에서 제외했습니다(원본에는 `yarn.lock`만 있었음).
+
+## 2026-07-27(3) — 폴더 연결이 "클릭은 되는데 진행이 안 됨" 버그 수정 + 헤더 정리 + 샘플 데이터 완전 제거
+
+사용자가 "LM Studio/폴더 연결 상태가 헤더에 부정확하게 나온다", "폴더 연결 안 하면 나머지
+기능이 막히는데, 정작 폴더 연결 버튼 자체가 진행이 안 된다", "불러오기/미디어
+라이브러리/블로그에서 가져오기를 버튼 하나로", "샘플 데이터 없이 실제 데이터로만 테스트"를
+요청. 실제 코드를 추적해 다음 근본 원인과 개선을 반영:
+
+1. **핵심 버그: 저장 폴더 연결이 예외가 나면 영원히 "연결 중..."에서 멈추는 문제**
+   (`store/useStore.ts`, `components/AppRoot.tsx`)
+   - `connectSaveFolder()` / `reconnectRememberedSaveFolder()` / `connectBlogDataFolder()`가
+     `pickDirectory()`/`verifyPermission()` 호출을 try/catch로 감싸지 않고 있었습니다.
+     브라우저가 폴더 선택창을 사용자 제스처로 인식하지 못해 `SecurityError`를 던지는 등
+     "취소" 외의 이유로 실패하면 이 함수들이 그대로 예외를 던졌는데, 이를 호출하는
+     화면 5곳(`StorageBar`, `NewProjectModal`, `MediaLibraryModal`, `BlogImportModal`,
+     채팅 화면의 폴더연결 배너)도 전부 try/catch 없이 `await`만 하고 있어서 버튼이
+     "연결 중..." 스피너 상태에서 절대 풀리지 않고, 폴더도 연결되지 않은 채 남아있었습니다.
+     **이것이 "폴더 연결부터 진행이 안 된다"는 증상의 실제 원인이었습니다.**
+   - `describeFolderPickError()` 헬퍼 신설 — 어떤 예외가 나도 절대 throw하지 않고 사람이
+     읽을 수 있는 한국어 오류 메시지로 변환해 `{ ok:false, message }`를 반환하도록
+     위 3개 store 함수를 전부 try/catch로 재작성.
+   - 방어적으로, 이 함수들을 호출하는 5곳의 컴포넌트 핸들러에도 try/finally를 추가해
+     (store 쪽에서 놓치는 게 있더라도) busy 상태가 절대 안 풀리는 일이 없도록 이중 안전장치.
+
+2. **LM Studio 연결 상태 배지 정확도 개선** (`components/AppRoot.tsx`의 `LlmStatusBadge`)
+   - 재확인 주기를 20초 → 8초로 단축.
+   - 창/탭이 다시 포커스를 받을 때(`focus`/`visibilitychange`) 즉시 재확인하도록 변경 —
+     사용자가 LM Studio를 켜고 이 탭으로 돌아왔을 때 최대 8초를 기다리지 않고 바로 반영.
+   - 오프라인 판정 시 이전에 남아있던 모델 목록도 함께 비워, "모델은 떠 있는데 연결은
+     끊긴 것처럼 보이는" 혼란을 제거.
+   - 첫 확인에서만 "확인 중..." 표시, 이후 백그라운드 재확인은 결과가 나올 때까지 이전
+     상태를 유지해 배지가 매번 깜빡이지 않도록 함.
+
+3. **헤더 정리 — "불러오기" + "미디어 라이브러리" + "블로그에서 가져오기"를 버튼 하나로 통합**
+   (`components/AppRoot.tsx`)
+   - 새 `ImportHubModal` 신설. 헤더의 세 버튼을 "가져오기" 버튼 하나로 교체하고, 클릭하면
+     이 허브 모달에서 세 기능을 카드로 골라 들어가도록 변경(`modal: 'import'` 신설,
+     `ModalState`에 추가). 각 카드에 지금 상태(예: "실제 저장 폴더를 먼저 연결해야
+     사용할 수 있습니다")를 미리 보여줘서 들어갔다가 다시 나오는 일을 줄임.
+   - 채팅/에디터 화면 안에서 문맥상 바로 여는 "미디어 라이브러리에서 변경",
+     "블로그에서 가져오기" 같은 딥링크 버튼들은 그대로 유지(그 자리에서 바로 여는 게
+     자연스러운 경우이므로).
+
+4. **샘플/데모 데이터 완전 제거**
+   - `store/useStore.ts`의 `SAMPLE_SCENES`/`SAMPLE_PROJECT`/`SAMPLE_PROJECTS`와, 실제로는
+     어디서도 렌더링에 쓰이지 않던 죽은 상태 `savedProjects`/`setSavedProjects`를 삭제.
+   - `public/sample-media/`, `public/sample-blog-data/` 폴더를 저장소에서 완전히 삭제
+     (코드 어디에서도 이 경로들을 참조하지 않는 것을 grep으로 확인했습니다). 이제 이
+     프로젝트에는 코드/에셋 어디에도 샘플 데이터가 남아있지 않고, 모든 프로젝트/장면/
+     블로그/미디어는 사용자가 연결하는 실제 폴더의 실제 파일에서만 만들어집니다.
+
+네트워크가 열려 있어 `npm install` → `./node_modules/.bin/tsc --noEmit`(오류 0건) →
+`npx next build`(`✓ Compiled successfully`, 4개 페이지 정적 생성 성공)까지 끝까지 검증했습니다.
+다만 이번에도 실제 LM Studio/실제 폴더를 켠 브라우저 기기에서의 최종 확인(설정 → LM Studio
+연결 확인, 헤더에서 폴더 연결 버튼 클릭 → 실제 탐색기 폴더 선택창이 뜨는지)은 사용자가 직접
+실기기에서 해주셔야 합니다.
+
+## 2026-07-27(4) — 편집기 폴더 게이팅 + LM Studio 배지 버그 수정 + 가져오기 뒤로가기 + 비슷한 이미지 추천 개편
+
+사용자 요청 5가지를 반영:
+
+1. **스토리보드 편집기, 폴더 미연결이면 화면 자체를 숨김** (`components/AppRoot.tsx`)
+   - `EditorInterface`가 실제 저장 폴더(`saveDirSource === 'external'`) 연결 여부를 받아,
+     연결 전에는 편집기 내용 대신 새 `EditorFolderGate` 잠금 화면(폴더 연결 버튼 포함)을
+     보여주도록 변경. store가 반응형이라 연결에 성공하는 순간 같은 렌더에서 바로 편집기가
+     나타나고, 채팅 화면은 기존처럼 계속 사용 가능합니다(배너로 안내만 함).
+   - 헤더의 "스토리보드 편집기" 버튼에도 폴더 미연결 시 자물쇠 아이콘 표시.
+
+2. **LM Studio 연결 확인이 "꺼져 있는데도 성공"으로 나오는 버그 수정** (`app/api/llm/health/route.ts`)
+   - 원인: 서버 쪽 `fetch(\`${baseUrl}/models\`)`에 캐시 옵션을 지정하지 않아, 예전에
+     LM Studio가 켜져 있었을 때의 성공 응답을 Next.js가 재사용할 수 있었습니다. 이 fetch에
+     `cache: 'no-store'`를 명시해 항상 새로 확인하도록 수정.
+   - 응답이 200이어도 실제 OpenAI 호환 `/models` 목록(`data.data`가 배열) 형태가 아니면
+     실패로 처리하도록 검증 강화(다른 서버가 그 포트에 우연히 응답하는 경우 대비).
+
+3. **가져오기 허브 → 하위 모달(불러오기/미디어 라이브러리/블로그에서 가져오기)에 뒤로가기 버튼**
+   (`components/AppRoot.tsx`)
+   - `LoadModal`, `MediaLibraryModal`, `BlogImportModal`에 `onBack?` prop 추가, 헤더 좌측에
+     ← 버튼 표시. `가져오기` 허브에서 들어간 경우 눌러서 카드 목록으로 바로 돌아갈 수 있음
+     (닫았다가 다시 여는 것보다 편리).
+
+4. **"비슷한 이미지 추천" 개편 — 프로젝트 미디어 분석 캐시 + 장면 전용 등록** (`store/useStore.ts`, `lib/fsAccess.ts`, `components/AppRoot.tsx`)
+   - `lib/fsAccess.ts`: `getProjectDir()` 신설, `MEDIA_ANALYSIS_FILE_NAME`
+     (`media_analysis.json`) 상수 추가 — 프로젝트 폴더 안 `media/`와 나란히 저장됩니다.
+   - `store/useStore.ts`: `MediaAnalysisEntry` 타입, `mediaAnalysisCache` 상태,
+     `ensureProjectMediaAnalysis()` 액션 신설. 저장 폴더가 연결돼 있으면 프로젝트 `media/`
+     폴더의 각 파일을 크기+수정시각으로 이전 분석 결과와 비교해, 바뀌지 않은 파일은
+     `media_analysis.json`에 이미 있는 데이터를 그대로 재사용하고, 새 파일만 새로 분석해
+     저장 폴더에 다시 저장합니다. (현재 연결 가능한 LM Studio 모델은 텍스트 전용이라 실제
+     비전 인식은 하지 못하므로, agent.md 10절과 같은 원칙으로 파일명 기반 태그/설명
+     휴리스틱을 "분석 결과"로 사용 — `analyzeMediaFileName()`. 나중에 비전 모델을 붙이면
+     이 함수만 교체하면 됩니다.)
+   - `Scene`에 `pinnedMediaPaths?: string[]` 필드 추가 — "비슷한 이미지 추천" 패널에서 이
+     장면 전용으로 등록한 미디어 파일 경로만 담아, 다른 장면의 추천 패널에는 나타나지
+     않게 함(기존 프로젝트 저장 형식과 그대로 호환 — 필드가 없으면 빈 배열로 처리).
+   - `components/AppRoot.tsx`의 `RecommendPanel` 전면 개편:
+     - "사진 등록"/"영상 등록" 버튼을 새로고침 버튼 왼쪽으로 이동(기존에는 `SceneEditor`
+       미리보기 아래에 있었음 — 그쪽 코드는 제거).
+     - 등록한 파일은 프로젝트 media 폴더에 저장되는 동시에 `scene.pinnedMediaPaths`에
+       기록되어, 이 장면의 추천 패널 상단에 "등록됨" 배지가 붙은 썸네일로 바로 나타나고
+       클릭하면 스토리보드(현재 장면)에 적용됩니다.
+     - 새로고침 버튼은 아래쪽 AI 추천 4칸만 다시 불러오고, "등록됨" 썸네일은 그대로 유지.
+     - AI 추천 4칸은 `ensureProjectMediaAnalysis()` 결과(태그/캡션)와 장면의 태그·제목을
+       비교해 점수가 높은 순으로 채우고, 프로젝트 미디어가 없으면 기존 블로그 기반 추천으로
+       자동 대체합니다.
+
+이번 세션은 네트워크가 열려있지 않아 `npm install`/`next build`로 끝까지 빌드 검증은 하지
+못했습니다. 대신 TypeScript 컴파일러(`typescript` 패키지)의 `transpileModule`로 수정한 4개
+파일(`components/AppRoot.tsx`, `store/useStore.ts`, `lib/fsAccess.ts`,
+`app/api/llm/health/route.ts`) 모두 구문 오류 없음을 확인했습니다 — 다만 이는 문법 검사이지
+`next build`가 하는 전체 타입 검사(다른 파일과의 타입 정합성 등)는 아니므로, 다음에 네트워크가
+열린 세션에서 `npm install && npx tsc --noEmit && npx next build`로 한 번 더 검증하는 것을
+권장합니다.
+
+## 2026-07-28 — 채팅도 저장 폴더 게이팅 적용 + LM Studio "생각 중 토큰 소진" 버그/속도 개선
+
+사용자 피드백: "스토리보드 편집기는 폴더 연결 안내가 잘 나오는데 채팅은 폴더 연결 없이도
+그냥 진행된다. 채팅도 편집기처럼 저장 폴더를 먼저 연결하라고 나와야 한다(폴더가 연결돼야
+채팅 내용이 폴더에 JSON으로 저장되기 때문)." + "몇 글자만 입력해도 '생각 단계에서 토큰을
+모두 써버렸다'는 오류가 뜬다. 이 문제도 고치고 LLM 응답 속도도 개선해달라."
+
+1. **채팅 화면도 저장 폴더 연결 전에는 숨김** (`components/AppRoot.tsx`)
+   - 어제(2026-07-27(4)) 편집기에 추가했던 잠금 화면(`EditorFolderGate`)을 범용
+     `FolderConnectGate({darkMode, title, description})`로 일반화해서 편집기/채팅 둘 다
+     재사용하도록 변경.
+   - `ChatInterface`도 이제 `saveDirSource === 'external' && saveDirHandle`이 아니면
+     채팅 UI 전체 대신 "채팅을 시작하려면 저장 폴더를 먼저 연결하세요" 화면을 보여줍니다.
+     연결되는 순간 store가 반응형이라 바로 채팅 화면이 나타납니다.
+   - 기존에 채팅 화면 안에 있던 "아직 실제 폴더를 연결하지 않아 임시 저장소만 쓰고
+     있어요" 주황색 배너(및 관련 `saveFolderBusy`/`saveFolderNotice`/
+     `handleConnectSaveFolderFromChat`)는 이제 항상 폴더가 연결된 상태에서만 채팅 화면에
+     들어오므로 절대 보일 일이 없어 완전히 제거했습니다(죽은 코드 정리).
+
+2. **"몇 글자만 입력해도 생각 단계에서 토큰을 다 써버림" 버그 + 응답 속도 개선** (`lib/llm.ts`)
+   - 근본 원인: 이 프로젝트 기본 모델(Qwen3 계열)은 답변 앞에 항상 "생각(thinking)" 블록을
+     먼저 생성하는데, 이 생각 단계의 길이는 사용자 입력 길이와 무관합니다. 인사 한마디에도
+     수백~수천 토큰을 생각에 쓰고 나면 `max_tokens` 예산이 바닥나 실제 답변이 한 글자도
+     못 나오는 경우가 흔했습니다.
+   - **속도+안정성 근본 해결책**: Qwen3가 공식 지원하는 `/no_think` 지시어를 "빠른모드"/
+     "보통모드"에서는 매 요청의 마지막 사용자 메시지 끝에 자동으로 붙여 생각 단계 자체를
+     건너뛰게 했습니다(`applyThinkingDirective()`, `prepareMessagesForRequest()`가 이제
+     `mode`를 받습니다). "전문가모드"(더 자세한 결과 원함)에서는 기존처럼 생각을 허용합니다.
+     생각을 건너뛰면 그만큼 응답도 훨씬 빨라집니다.
+   - **안전망**: `/no_think`를 지시했는데도 일부 모델/설정이 계속 생각만 하다가 예산을 다
+     써버려 답변이 완전히 비어 있는 경우, 예전에는 바로 사용자에게 오류를 보여줬지만
+     이제는 훨씬 큰 예산(기존의 3배, 최대 8000토큰)으로 **자동으로 한 번 더 재시도**한
+     뒤에도 실패해야만 오류 메시지를 보여주도록 `streamChat()`을 재구성했습니다
+     (`attemptStreamChat()` 헬퍼로 한 번의 시도 로직을 분리하고, 재시도 로직을 추가).
+   - `chatOnce()`(스토리보드 JSON 생성, 나레이션 재생성 등)에도 동일하게 `mode`를 넘겨
+     `/no_think`가 적용되도록 했습니다 — 스토리보드 생성 쪽은 이미 실패 시 더 큰 예산의
+     "전문가모드"로 한 번 더 시도하고, 그래도 안 되면 대화 내용을 그대로 장면으로 바꾸는
+     3단계 안전망(`generateJsonWithGuaranteedFallback`)이 있어 그대로 두었습니다.
+
+이번 세션도 네트워크가 열려있지 않아 TypeScript `transpileModule` 구문 검사만
+(`components/AppRoot.tsx`, `store/useStore.ts`, `lib/fsAccess.ts`, `lib/llm.ts`,
+`app/api/llm/health/route.ts` 전부 통과) 진행했고, `next build`로 끝까지 검증하지는
+못했습니다. 다음에 네트워크가 열린 세션에서 `npm install && npx next build`로 한 번
+확인해보시길 권장드립니다. 또한 실제 LM Studio에서 `/no_think` 지시어가 잘 인식되는지
+(Qwen3 계열이 아닌 다른 모델을 쓰는 경우 이 지시어가 텍스트로 그대로 노출될 수 있음)는
+실기기에서 확인이 필요합니다.
+
+
+

@@ -299,3 +299,54 @@ export async function queryPermissionSilently(handle: any, mode: 'read' | 'readw
     return false;
   }
 }
+
+// ─── 프로젝트별 미디어 폴더 (2026-07-27 추가) ────────────────────────────────
+//
+// 요청사항: "스토리보드 편집기에서 사진(과 영상)도 등록할 수 있게 만들고, 저장 폴더 안에
+// 프로젝트별로 폴더를 만들어 저장해서 사용자가 탐색기에서도 쉽게 볼 수 있어야 함."
+// 저장 폴더(KWJMvideoAI_data) 안에 projects/<프로젝트 이름>/media/ 형태로 실제 파일을
+// 복사해 저장합니다 (이전까지의 "미디어 폴더 연결"은 사용자가 이미 갖고 있는 사진들을
+// 읽기 전용으로 참조하는 기능이고, 이건 그와 별개로 앱에서 새로 등록하는 파일을 저장하는
+// 전용 공간입니다).
+
+/** 프로젝트 이름을 폴더명으로 써도 안전하도록 정리합니다. 빈 이름이면 기본값을 씁니다. */
+export function sanitizeProjectFolderName(name: string): string {
+  const trimmed = (name || '').trim();
+  const safe = trimmed.replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, '_');
+  return safe || 'untitled_project';
+}
+
+/** 데이터 폴더(KWJMvideoAI_data) 안에 projects/<프로젝트명> 폴더 자체(media의 부모)를 가져오거나 만듭니다.
+ *  media_analysis.json처럼 media/ 폴더와 나란히 두는 프로젝트 단위 파일이 필요할 때 사용합니다. */
+export async function getProjectDir(dataDirHandle: any, projectName: string): Promise<any> {
+  const projectsDir = await getOrCreateSubDirectory(dataDirHandle, PROJECTS_DIR_NAME);
+  return getOrCreateSubDirectory(projectsDir, sanitizeProjectFolderName(projectName));
+}
+
+/** 데이터 폴더(KWJMvideoAI_data) 안에 projects/<프로젝트명>/media 폴더를 가져오거나 만듭니다. */
+export async function getProjectMediaDir(dataDirHandle: any, projectName: string): Promise<any> {
+  const projectDir = await getProjectDir(dataDirHandle, projectName);
+  return getOrCreateSubDirectory(projectDir, 'media');
+}
+
+/** 프로젝트별 "이미지 분석" 캐시 파일 이름 — media/ 폴더 안의 파일별 태그/설명을 저장해두고,
+ *  다음에 같은 폴더를 다시 열었을 때 재분석 없이 그대로 재사용합니다 (2026-07-27(4) 추가). */
+export const MEDIA_ANALYSIS_FILE_NAME = 'media_analysis.json';
+
+/** 디렉토리 핸들 안에 바이너리 파일(Blob/File)을 새로 만들거나 덮어씁니다. */
+export async function writeBinaryFile(dirHandle: any, fileName: string, data: Blob | ArrayBuffer): Promise<void> {
+  const fileHandle = await dirHandle.getFileHandle(fileName, { create: true });
+  const writable = await fileHandle.createWritable();
+  await writable.write(data);
+  await writable.close();
+}
+
+/** 같은 이름의 파일이 이미 있어도 겹치지 않도록, 타임스탬프를 붙인 저장용 파일명을 만듭니다. */
+export function buildUniqueMediaFileName(originalName: string): string {
+  const trimmed = (originalName || 'file').trim() || 'file';
+  const dot = trimmed.lastIndexOf('.');
+  const base = dot > 0 ? trimmed.slice(0, dot) : trimmed;
+  const ext = dot > 0 ? trimmed.slice(dot) : '';
+  const safeBase = base.replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, '_').slice(0, 80) || 'file';
+  return `${Date.now()}_${Math.random().toString(36).slice(2, 6)}_${safeBase}${ext}`;
+}

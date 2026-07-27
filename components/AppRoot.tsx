@@ -2,7 +2,7 @@
 
 import React, { useState, useRef, useEffect } from 'react';
 import { useStore, sanitizeScenesForSave } from '@/store/useStore';
-import type { Scene, Project, LlmMode } from '@/store/useStore';
+import type { Scene, Project, LlmMode, MediaAnalysisEntry } from '@/store/useStore';
 import {
   isFileSystemAccessSupported,
   pickDirectory,
@@ -23,6 +23,7 @@ import {
   blogMediaFileName,
   stripHtml,
   type BlogMediaMeta,
+  type BlogPost,
 } from '@/lib/blogData';
 import {
   streamChat,
@@ -82,6 +83,9 @@ import {
   Gauge,
   Search,
   ImageOff,
+  Lock,
+  ArrowLeft,
+  Pin,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
@@ -116,6 +120,43 @@ const RECOMMEND_POOLS: Record<string, string[]> = {
   ],
 };
 
+/**
+ * 2026-07-27(2): "비슷한 이미지 추천" 패널이 인터넷 스톡 사진 대신, 실제로 가져온 블로그
+ * 사진 중에서 이 장면과 어울릴 만한 것을 찾아 추천하도록 하는 점수 계산 함수입니다.
+ *  - 같은 블로그 글에서 나온 사진이면 가장 높은 점수를 줍니다(이미 문맥이 같으므로).
+ *  - 장면의 태그가 사진 캡션/위치나 글 제목/태그와 겹치면 점수를 더합니다.
+ *  - 이미 이 장면에 적용되어 있는 바로 그 사진은 추천 목록에서 제외합니다.
+ */
+function scoreBlogMediaForScene(item: BlogMediaMeta, scene: Scene, postsById: Map<string, BlogPost>): number {
+  if (scene.sourceMediaId && item.id === scene.sourceMediaId) return -Infinity;
+  let score = 0;
+  if (scene.sourcePostId && item.postId === scene.sourcePostId) score += 10;
+  const post = postsById.get(item.postId);
+  const haystack = `${item.caption} ${item.location} ${post?.title ?? ''} ${(post?.tags ?? []).join(' ')} ${post?.category ?? ''}`.toLowerCase();
+  for (const tag of scene.tags ?? []) {
+    if (tag && haystack.includes(tag.toLowerCase())) score += 3;
+  }
+  return score;
+}
+
+/** 장면과 어울릴 만한 블로그 사진을 최대 `limit`개 골라 반환합니다(사진이 없으면 빈 배열). */
+function getBlogRecommendationsForScene(
+  scene: Scene,
+  blogPosts: BlogPost[],
+  blogMedia: BlogMediaMeta[],
+  limit = 4
+): BlogMediaMeta[] {
+  const images = blogMedia.filter((m) => m.type === 'image');
+  if (images.length === 0) return [];
+  const postsById = new Map(blogPosts.map((p) => [p.id, p]));
+  return images
+    .map((item) => ({ item, score: scoreBlogMediaForScene(item, scene, postsById) }))
+    .filter((s) => Number.isFinite(s.score))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map((s) => s.item);
+}
+
 function getRecommendations(scene: Scene): string[] {
   const tags = scene.tags ?? [];
   let pool = RECOMMEND_POOLS.beach;
@@ -128,18 +169,29 @@ function getRecommendations(scene: Scene): string[] {
 
 /**
  * LLM이 골라준 mediaId(블로그 media-meta의 id)를 실제 사진/영상 파일로 변환해 씬에 채워 넣습니다.
- * mediaId가 없거나 파일을 찾지 못하면 태그 기반 추천 이미지로 대체합니다.
+ *
+ * 2026-07-28 개선: 예전에는 mediaId가 없거나(LLM이 null로 두거나 잘못된 값을 준 경우) 곧바로
+ * 인터넷 스톡 사진(RECOMMEND_POOLS, 블로그와 무관한 임의 이미지)으로 대체해서, "블로그 데이터를
+ * 가져왔는데 스토리보드에는 관련 없는 사진이 붙는" 문제가 있었습니다. 이제는 그 전에 먼저 실제로
+ * 가져온 블로그 사진들 중 이 장면의 태그/키워드와 가장 잘 맞는 것을 `scoreBlogMediaForScene`로
+ * 찾아 배정합니다(이미 다른 장면에 쓰인 사진은 제외해 중복을 최대한 피합니다). 블로그 사진이
+ * 전혀 없을 때만 최후 수단으로 스톡 이미지를 씁니다.
  */
 async function resolveScenesWithBlogMedia(
   scenes: Omit<Scene, 'id'>[],
   mediaIds: (string | null)[],
   blogDirHandle: any,
-  blogMedia: BlogMediaMeta[]
+  blogMedia: BlogMediaMeta[],
+  blogPosts: BlogPost[] = []
 ): Promise<Scene[]> {
-  // 2026-07-23: 각 장면의 미디어 파일 읽기는 서로 독립적이므로 순차 대기 대신 병렬로 처리해
-  // 장면 수가 많은 프로젝트에서 스토리보드 생성 체감 속도를 높입니다.
-  return Promise.all(
-    scenes.map(async (base, i) => {
+  const postsById = new Map(blogPosts.map((p) => [p.id, p]));
+  const usedMediaIds = new Set<string>();
+
+  // 1단계: LLM이 명시적으로 지정한 mediaId부터 먼저 확정해서(순서대로 처리해야 "먼저 쓴
+  // 사진은 다른 장면이 다시 쓰지 않는다"는 중복 방지가 정확히 동작합니다) usedMediaIds를 채웁니다.
+  const resolved: Scene[] = [];
+  for (let i = 0; i < scenes.length; i++) {
+    const base = scenes[i];
     const mediaId = mediaIds[i];
     let photoRef = '';
     let localImageName: string | undefined;
@@ -163,6 +215,7 @@ async function resolveScenesWithBlogMedia(
             }
             sourceMediaId = item.id;
             sourcePostId = item.postId;
+            usedMediaIds.add(item.id);
           }
         } catch (err) {
           console.error('블로그 미디어를 불러오지 못했습니다:', err);
@@ -170,22 +223,52 @@ async function resolveScenesWithBlogMedia(
       }
     }
 
+    // 2단계: mediaId가 없거나(null) LLM이 지정한 값을 불러오지 못했다면, 실제로 가져온
+    // 블로그 사진 중 이 장면과 가장 잘 맞는 것을 키워드 기반으로 찾아 대신 배정합니다.
+    if (!photoRef && !localVideoUrl && blogDirHandle && blogMedia.length > 0) {
+      const sceneLike = { tags: base.tags, sourceMediaId: undefined, sourcePostId: undefined } as Scene;
+      const candidates = blogMedia
+        .filter((m) => m.type === 'image' && !usedMediaIds.has(m.id))
+        .map((item) => ({ item, score: scoreBlogMediaForScene(item, sceneLike, postsById) }))
+        .filter((s) => Number.isFinite(s.score))
+        .sort((a, b) => b.score - a.score);
+
+      for (const candidate of candidates) {
+        try {
+          const url = await blogMediaPreviewUrl(blogDirHandle, candidate.item);
+          if (url) {
+            photoRef = url;
+            localImageName = blogMediaFileName(candidate.item.url);
+            sourceMediaId = candidate.item.id;
+            sourcePostId = candidate.item.postId;
+            usedMediaIds.add(candidate.item.id);
+            break;
+          }
+        } catch (err) {
+          console.error('블로그 추천 사진을 불러오지 못했습니다:', err);
+        }
+      }
+    }
+
+    // 3단계(최후 수단): 블로그 사진이 아예 없거나 위 두 단계 모두 실패한 경우에만
+    // 태그 기반의 일반 스톡 이미지로 대체합니다.
     if (!photoRef && !localVideoUrl) {
       photoRef = getRecommendations({ tags: base.tags } as Scene)[0] ?? RECOMMEND_POOLS.beach[0];
     }
 
-      return {
-        id: genId('scene'),
-        ...base,
-        photoRef,
-        localImageName,
-        localVideoName,
-        localVideoUrl,
-        sourceMediaId,
-        sourcePostId,
-      };
-    })
-  );
+    resolved.push({
+      id: genId('scene'),
+      ...base,
+      photoRef,
+      localImageName,
+      localVideoName,
+      localVideoUrl,
+      sourceMediaId,
+      sourcePostId,
+    });
+  }
+
+  return resolved;
 }
 
 function genId(prefix: string): string {
@@ -195,7 +278,12 @@ function genId(prefix: string): string {
 // ─── Main App ─────────────────────────────────────────────────────────────────
 
 export default function AppRoot() {
-  const { view, setView, modal, setModal, darkMode, setDarkMode, initStorage } = useStore();
+  const { view, setView, modal, setModal, darkMode, setDarkMode, initStorage, saveDirSource, saveDirHandle } = useStore();
+  // 2026-07-27(4): "폴더 지정 안 되어있으면 스토리보드 편집기 화면이 안 보여야 한다"는
+  // 요청 — 실제 사용자 폴더(saveDirSource === 'external')가 연결되기 전에는 편집기 화면을
+  // 잠금 안내 화면으로 대체합니다. 연결되는 즉시(store가 반응형이므로 새로고침 없이) 채팅
+  // 화면과 편집기 화면 모두 정상적으로 나타납니다.
+  const hasRealFolder = saveDirSource === 'external' && !!saveDirHandle;
 
   useEffect(() => {
     if (darkMode) document.documentElement.classList.add('dark');
@@ -227,11 +315,16 @@ export default function AppRoot() {
         )}
       >
         <div className="flex items-center gap-5">
-          {/* Logo */}
-          <div className="flex items-center gap-2 text-indigo-600 dark:text-indigo-400 shrink-0">
+          {/* Logo — 2026-07-27(2): 클릭하면 바로 채팅 화면으로 이동합니다. */}
+          <button
+            type="button"
+            onClick={() => setView('chat')}
+            title="채팅으로 이동"
+            className="flex items-center gap-2 text-indigo-600 dark:text-indigo-400 shrink-0 hover:opacity-80 transition-opacity"
+          >
             <Clapperboard className="w-5 h-5" />
             <span className="font-bold text-base tracking-tight">KWJMvideoAI</span>
-          </div>
+          </button>
 
           {/* Divider */}
           <div className={cn('w-px h-5', darkMode ? 'bg-neutral-800' : 'bg-neutral-200')} />
@@ -246,7 +339,7 @@ export default function AppRoot() {
               darkMode={darkMode}
             />
             <HeaderNavBtn
-              icon={<Clapperboard className="w-3.5 h-3.5" />}
+              icon={hasRealFolder ? <Clapperboard className="w-3.5 h-3.5" /> : <Lock className="w-3.5 h-3.5" />}
               label="스토리보드 편집기"
               active={view === 'editor'}
               onClick={() => setView('editor')}
@@ -260,27 +353,15 @@ export default function AppRoot() {
               darkMode={darkMode}
             />
             <HeaderNavBtn
-              icon={<FolderOpen className="w-3.5 h-3.5" />}
-              label="불러오기"
-              onClick={() => setModal('load')}
+              icon={<Upload className="w-3.5 h-3.5" />}
+              label="가져오기"
+              onClick={() => setModal('import')}
               darkMode={darkMode}
             />
             <HeaderNavBtn
               icon={<Download className="w-3.5 h-3.5" />}
               label="내보내기"
               onClick={() => setModal('export')}
-              darkMode={darkMode}
-            />
-            <HeaderNavBtn
-              icon={<ImageIcon className="w-3.5 h-3.5" />}
-              label="미디어 라이브러리"
-              onClick={() => setModal('media')}
-              darkMode={darkMode}
-            />
-            <HeaderNavBtn
-              icon={<Newspaper className="w-3.5 h-3.5" />}
-              label="블로그에서 가져오기"
-              onClick={() => setModal('blog-import')}
               darkMode={darkMode}
             />
           </nav>
@@ -345,7 +426,7 @@ export default function AppRoot() {
               transition={{ duration: 0.2 }}
               className="flex-1 flex overflow-hidden"
             >
-              <EditorInterface darkMode={darkMode} />
+              <EditorInterface darkMode={darkMode} hasRealFolder={hasRealFolder} />
             </motion.div>
           )}
         </AnimatePresence>
@@ -356,20 +437,27 @@ export default function AppRoot() {
         {modal === 'new-project' && (
           <NewProjectModal darkMode={darkMode} onClose={() => setModal(null)} />
         )}
+        {modal === 'import' && (
+          <ImportHubModal
+            darkMode={darkMode}
+            onClose={() => setModal(null)}
+            onPick={(target) => setModal(target)}
+          />
+        )}
         {modal === 'load' && (
-          <LoadModal darkMode={darkMode} onClose={() => setModal(null)} />
+          <LoadModal darkMode={darkMode} onClose={() => setModal(null)} onBack={() => setModal('import')} />
         )}
         {modal === 'export' && (
           <ExportModal darkMode={darkMode} onClose={() => setModal(null)} />
         )}
         {modal === 'media' && (
-          <MediaLibraryModal darkMode={darkMode} onClose={() => setModal(null)} />
+          <MediaLibraryModal darkMode={darkMode} onClose={() => setModal(null)} onBack={() => setModal('import')} />
         )}
         {modal === 'settings' && (
           <SettingsModal darkMode={darkMode} onClose={() => setModal(null)} />
         )}
         {modal === 'blog-import' && (
-          <BlogImportModal darkMode={darkMode} onClose={() => setModal(null)} />
+          <BlogImportModal darkMode={darkMode} onClose={() => setModal(null)} onBack={() => setModal('import')} />
         )}
       </AnimatePresence>
     </div>
@@ -383,18 +471,34 @@ function LlmStatusBadge({ darkMode, onClick }: { darkMode: boolean; onClick: () 
 
   useEffect(() => {
     let cancelled = false;
+    let isFirstCheck = true;
     const check = async () => {
-      setLlmStatus('checking');
+      // 2026-07-27(3): 첫 확인에서만 "확인 중..." 표시를 보여주고, 이후 백그라운드
+      // 재확인에서는 결과가 나올 때까지 이전 상태를 그대로 유지합니다(깜빡임 방지).
+      if (isFirstCheck) setLlmStatus('checking');
       const health = await checkLlmHealth(llmBaseUrl);
       if (cancelled) return;
+      isFirstCheck = false;
       setLlmStatus(health.ok ? 'online' : 'offline');
-      if (health.ok) setLlmAvailableModels(health.models);
+      // 연결이 끊긴 상태에서도 이전에 있던 모델 목록이 남아있으면 "여전히 연결된 것처럼"
+      // 보일 수 있어, 오프라인이면 모델 목록도 함께 비웁니다.
+      setLlmAvailableModels(health.ok ? health.models : []);
     };
     check();
-    const interval = setInterval(check, 20000);
+    // 헤더의 상태가 실제와 최대한 가깝게 맞도록 주기를 짧게 두고(8초), 사용자가 다른 탭/
+    // 창에서 LM Studio를 켜고 다시 이 탭으로 돌아왔을 때도 기다리지 않고 즉시 재확인합니다.
+    const interval = setInterval(check, 8000);
+    const onFocusOrVisible = () => {
+      if (document.visibilityState === 'hidden') return;
+      check();
+    };
+    window.addEventListener('focus', onFocusOrVisible);
+    document.addEventListener('visibilitychange', onFocusOrVisible);
     return () => {
       cancelled = true;
       clearInterval(interval);
+      window.removeEventListener('focus', onFocusOrVisible);
+      document.removeEventListener('visibilitychange', onFocusOrVisible);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [llmBaseUrl]);
@@ -522,7 +626,6 @@ function StorageBar({ darkMode }: { darkMode: boolean }) {
     saveDirSource,
     rememberedSaveDirName,
     reconnectRememberedSaveFolder,
-    mediaDirName,
     saveStatus,
     saveError,
     lastSavedAt,
@@ -530,13 +633,11 @@ function StorageBar({ darkMode }: { darkMode: boolean }) {
     setAutoSaveEnabled,
     connectSaveFolder,
     disconnectSaveFolder,
-    connectMediaFolder,
-    disconnectMediaFolder,
     saveAllToFolder,
   } = useStore();
 
   const [fsSupported, setFsSupported] = useState(true);
-  const [busy, setBusy] = useState<'save' | 'media' | 'reconnect' | null>(null);
+  const [busy, setBusy] = useState<'save' | 'reconnect' | null>(null);
   const [notice, setNotice] = useState<{ tone: 'ok' | 'error'; text: string } | null>(null);
 
   useEffect(() => {
@@ -551,30 +652,41 @@ function StorageBar({ darkMode }: { darkMode: boolean }) {
 
   const handleConnectSave = async () => {
     setBusy('save');
-    const res = await connectSaveFolder();
-    setBusy(null);
-    if (res.message) setNotice({ tone: res.ok ? 'ok' : 'error', text: res.message });
+    try {
+      const res = await connectSaveFolder();
+      if (res.message) setNotice({ tone: res.ok ? 'ok' : 'error', text: res.message });
+    } catch (err) {
+      console.error(err);
+      setNotice({ tone: 'error', text: '폴더를 연결하는 중 예기치 못한 오류가 발생했습니다.' });
+    } finally {
+      setBusy(null);
+    }
   };
 
   const handleReconnect = async () => {
     setBusy('reconnect');
-    const res = await reconnectRememberedSaveFolder();
-    setBusy(null);
-    if (res.message) setNotice({ tone: res.ok ? 'ok' : 'error', text: res.message });
+    try {
+      const res = await reconnectRememberedSaveFolder();
+      if (res.message) setNotice({ tone: res.ok ? 'ok' : 'error', text: res.message });
+    } catch (err) {
+      console.error(err);
+      setNotice({ tone: 'error', text: '폴더를 다시 연결하는 중 예기치 못한 오류가 발생했습니다.' });
+    } finally {
+      setBusy(null);
+    }
   };
 
   const handleManualSave = async () => {
     setBusy('save');
-    const res = await saveAllToFolder();
-    setBusy(null);
-    if (!res.ok && res.message) setNotice({ tone: 'error', text: res.message });
-  };
-
-  const handleConnectMedia = async () => {
-    setBusy('media');
-    const res = await connectMediaFolder();
-    setBusy(null);
-    if (res.message) setNotice({ tone: res.ok ? 'ok' : 'error', text: res.message });
+    try {
+      const res = await saveAllToFolder();
+      if (!res.ok && res.message) setNotice({ tone: 'error', text: res.message });
+    } catch (err) {
+      console.error(err);
+      setNotice({ tone: 'error', text: '저장하는 중 예기치 못한 오류가 발생했습니다.' });
+    } finally {
+      setBusy(null);
+    }
   };
 
   // 마지막에 연결했던 실제 폴더가 있는데, 지금은(자동으로) OPFS 자동 저장소만 붙어있는 상태면
@@ -662,35 +774,22 @@ function StorageBar({ darkMode }: { darkMode: boolean }) {
 
           <div className={cn('w-px h-4', darkMode ? 'bg-neutral-800' : 'bg-neutral-200')} />
 
-          {/* 미디어 폴더 상태 */}
+          {/* 2026-07-27(2): "미디어 폴더"를 별도로 연결하던 개념을 없애고 저장 폴더(자동
+              저장소 포함)와 완전히 합쳤습니다. 사진/영상도 항상 이 저장 폴더 안에 저장되므로,
+              여기서는 실제 폴더가 연결되어 있는지에 따른 안내만 보여줍니다. */}
           <div className="flex items-center gap-1.5">
-            {mediaDirName ? (
+            {saveDirSource === 'external' ? (
               <>
-                <FolderCheck className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
-                <span className="font-medium">미디어 폴더: "{mediaDirName}"</span>
-                <button
-                  onClick={disconnectMediaFolder}
-                  title="미디어 폴더 연결 해제"
-                  className={cn(
-                    'ml-0.5 w-5 h-5 flex items-center justify-center rounded transition-colors',
-                    darkMode ? 'hover:bg-neutral-800 text-neutral-500' : 'hover:bg-neutral-200 text-neutral-400'
-                  )}
-                >
-                  <Link2Off className="w-3.5 h-3.5" />
-                </button>
+                <ImageIcon className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
+                <span className={cn(darkMode ? 'text-neutral-400' : 'text-neutral-500')}>사진·영상도 저장 폴더에 함께 저장됩니다</span>
               </>
             ) : (
-              <button
-                onClick={handleConnectMedia}
-                disabled={busy === 'media'}
-                className={cn(
-                  'flex items-center gap-1.5 font-medium px-2.5 py-1 rounded-md transition-colors',
-                  darkMode ? 'text-emerald-400 hover:bg-emerald-500/10' : 'text-emerald-600 hover:bg-emerald-50'
-                )}
-              >
-                {busy === 'media' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ImageIcon className="w-3.5 h-3.5" />}
-                미디어 폴더 연결
-              </button>
+              <>
+                <AlertCircle className="w-3.5 h-3.5 text-amber-500 shrink-0" />
+                <span className={cn(darkMode ? 'text-neutral-400' : 'text-neutral-500')}>
+                  사진/영상 등록 기능을 쓰려면 먼저 저장 폴더를 등록하세요
+                </span>
+              </>
             )}
           </div>
 
@@ -788,7 +887,13 @@ function ChatInterface({ onComplete, darkMode }: { onComplete: () => void; darkM
     setCurrentProject,
     setModal,
     pushEditLog,
+    saveDirSource,
+    saveDirHandle,
   } = useStore();
+  // 2026-07-28: 채팅도 스토리보드 편집기와 동일하게, 실제 저장 폴더가 연결되기 전에는
+  // 화면 자체를 숨기고 폴더 연결 안내만 보여줍니다 — 채팅 내용이 저장 폴더 안에 JSON으로
+  // 저장되려면 실제 폴더 연결이 먼저 필요하기 때문입니다.
+  const hasRealFolder = saveDirSource === 'external' && !!saveDirHandle;
   const [input, setInput] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamingText, setStreamingText] = useState('');
@@ -837,10 +942,14 @@ function ChatInterface({ onComplete, darkMode }: { onComplete: () => void; darkM
         },
       });
       addChatMessage('assistant', full.trim() || '(빈 응답을 받았습니다)');
-    } catch (err) {
+    } catch (err: any) {
+      // 2026-07-27: 예전에는 원인이 무엇이든(빈 응답, 400 오류, 연결 안 됨 등) 항상 같은
+      // "연결하지 못했습니다" 메시지만 보여줘서 실제 원인(예: 추론 모델이 토큰을 다 써버림,
+      // 채팅 템플릿 400 오류 등)을 알 수 없었습니다. lib/llm.ts가 던지는 구체적인 오류
+      // 메시지를 그대로 보여주고, 메시지가 없을 때만 기존의 일반적인 안내를 사용합니다.
       addChatMessage(
         'assistant',
-        `⚠️ LM Studio 서버(${llmBaseUrl})에 연결하지 못했습니다. LM Studio 앱에서 "Local Server"가 켜져 있고, 모델(${llmModel})이 로드되어 있는지 확인한 뒤 다시 시도해주세요. 헤더의 "설정"에서 주소/모델을 바꿀 수 있습니다.`
+        `⚠️ ${err?.message || `LM Studio 서버(${llmBaseUrl})에 연결하지 못했습니다. LM Studio 앱에서 "Local Server"가 켜져 있고, 모델(${llmModel})이 로드되어 있는지 확인한 뒤 다시 시도해주세요. 헤더의 "설정"에서 주소/모델을 바꿀 수 있습니다.`}`
       );
     } finally {
       setIsStreaming(false);
@@ -863,7 +972,7 @@ function ChatInterface({ onComplete, darkMode }: { onComplete: () => void; darkM
       });
 
       setBuildStage('사진·영상을 장면에 배치하는 중...');
-      const resolved = await resolveScenesWithBlogMedia(rawScenes, rawMediaIds, blogDirHandle, selectedMedia);
+      const resolved = await resolveScenesWithBlogMedia(rawScenes, rawMediaIds, blogDirHandle, selectedMedia, selectedPosts);
 
       setScenes(resolved);
       setSelectedSceneId(resolved[0]?.id ?? null);
@@ -898,6 +1007,19 @@ function ChatInterface({ onComplete, darkMode }: { onComplete: () => void; darkM
 
   const hasUserMessage = messages.some((m) => m.role === 'user');
   const canBuild = hasUserMessage && !isStreaming && !isBuildingStoryboard;
+
+  // 2026-07-28: 실제 저장 폴더가 연결되어 있지 않으면 채팅 화면 자체를 숨기고, 스토리보드
+  // 편집기와 동일한 폴더 연결 안내 화면을 보여줍니다. store가 반응형이라 연결에 성공하는
+  // 순간 이 화면이 사라지고 채팅 화면이 바로 나타납니다.
+  if (!hasRealFolder) {
+    return (
+      <FolderConnectGate
+        darkMode={darkMode}
+        title="채팅을 시작하려면 저장 폴더를 먼저 연결하세요"
+        description="폴더를 연결해야 채팅 내용과 스토리보드가 실제 저장 폴더 안에 JSON 파일로 저장됩니다. 폴더를 연결하면 이 화면이 즉시 사라지고 채팅이 시작됩니다."
+      />
+    );
+  }
 
   return (
     <div className="flex-1 flex min-h-0">
@@ -1133,7 +1255,62 @@ function ChatInterface({ onComplete, darkMode }: { onComplete: () => void; darkM
 
 // ─── Editor Interface ─────────────────────────────────────────────────────────
 
-function EditorInterface({ darkMode }: { darkMode: boolean }) {
+// ─── 저장 폴더 연결 잠금 화면 (2026-07-27(4) 신설, 2026-07-28 채팅 화면에도 재사용) ──────
+//
+// 요청사항: "스토리보드 편집기도 폴더 지정 안 되어있으면 화면 안 보이게 만들고, 폴더
+// 지정되면 시작할 수 있게, 연결 즉시 채팅 화면 및 스토리보드 편집기 화면이 나와야 함."
+// → 이후 "채팅도 편집기처럼 폴더 연결 화면이 나와야 한다"는 후속 요청으로, 채팅/편집기
+// 두 화면 모두 이 컴포넌트를 그대로 재사용합니다. store가 반응형이라 연결에 성공하는
+// 순간(같은 렌더 사이클 안에서) 이 화면이 사라지고 실제 화면이 즉시 나타납니다 —
+// 새로고침이나 재진입이 필요 없습니다.
+function FolderConnectGate({
+  darkMode,
+  title,
+  description,
+}: {
+  darkMode: boolean;
+  title: string;
+  description: string;
+}) {
+  const { rememberedSaveDirName, connectSaveFolder, reconnectRememberedSaveFolder } = useStore();
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const handleConnect = async () => {
+    setBusy(true);
+    setNotice(null);
+    try {
+      const res = rememberedSaveDirName ? await reconnectRememberedSaveFolder() : await connectSaveFolder();
+      if (!res.ok && res.message) setNotice(res.message);
+    } catch (err) {
+      console.error(err);
+      setNotice('폴더를 연결하는 중 예기치 못한 오류가 발생했습니다.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex-1 flex flex-col items-center justify-center gap-3 text-center px-6">
+      <div className={cn('w-16 h-16 rounded-2xl flex items-center justify-center', darkMode ? 'bg-neutral-800' : 'bg-neutral-100')}>
+        <Lock className={cn('w-7 h-7', darkMode ? 'text-neutral-500' : 'text-neutral-400')} />
+      </div>
+      <p className="text-base font-semibold">{title}</p>
+      <p className={cn('text-sm max-w-md leading-relaxed', darkMode ? 'text-neutral-400' : 'text-neutral-500')}>{description}</p>
+      <button
+        onClick={handleConnect}
+        disabled={busy}
+        className="mt-1 flex items-center gap-1.5 font-medium px-4 py-2 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50 transition-colors"
+      >
+        {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Link2 className="w-4 h-4" />}
+        {rememberedSaveDirName ? '이전 저장 폴더 다시 연결' : '저장 폴더 연결하기'}
+      </button>
+      {notice && <p className="text-xs text-rose-500 max-w-sm">{notice}</p>}
+    </div>
+  );
+}
+
+function EditorInterface({ darkMode, hasRealFolder }: { darkMode: boolean; hasRealFolder: boolean }) {
   const {
     scenes,
     selectedSceneId,
@@ -1144,6 +1321,19 @@ function EditorInterface({ darkMode }: { darkMode: boolean }) {
     currentProject,
   } = useStore();
   const selectedScene = scenes.find((s) => s.id === selectedSceneId) ?? scenes[0] ?? null;
+
+  // 2026-07-27(4): 실제 저장 폴더가 연결되어 있지 않으면 스토리보드 편집기 화면 자체를
+  // 보여주지 않고, 폴더를 연결하라는 잠금 화면으로 대체합니다. store가 반응형이라 폴더
+  // 연결이 성공하는 순간 이 조건이 바뀌어 별도 새로고침 없이 바로 편집기가 나타납니다.
+  if (!hasRealFolder) {
+    return (
+      <FolderConnectGate
+        darkMode={darkMode}
+        title="스토리보드 편집기를 시작하려면 저장 폴더를 먼저 연결하세요"
+        description="사진/영상 등록, 프로젝트 저장, 비슷한 이미지 추천이 모두 실제 저장 폴더 안에 파일로 보관됩니다. 폴더를 연결하면 이 화면이 즉시 사라지고 편집기가 시작됩니다."
+      />
+    );
+  }
 
   return (
     <div className="flex-1 flex overflow-hidden">
@@ -1482,7 +1672,8 @@ function SceneEditor({ scene, darkMode }: { scene: Scene; darkMode: boolean }) {
           )}
         </div>
 
-        {/* 로컬 미디어 참조 표시 */}
+        {/* 로컬 미디어 참조 표시 — 2026-07-27(4): "사진 등록"/"영상 등록" 버튼은 이제
+            우측 "비슷한 이미지 추천" 패널의 새로고침 버튼 왼쪽으로 옮겼습니다(RecommendPanel 참고). */}
         {(scene.localImageName || scene.localVideoName) && (
           <div className="flex flex-wrap items-center gap-2 mt-2">
             {scene.localImageName && (
@@ -1677,30 +1868,238 @@ function Field({
 
 // ─── Recommend Panel (right) ──────────────────────────────────────────────────
 
+// 2026-07-27(4): 프로젝트 media 폴더의 파일들을 이미지 분석 캐시(MediaAnalysisEntry)와
+// 비교해 이 장면과 가장 어울리는 순서로 정렬합니다. 태그/캡션에 장면의 태그·제목 단어가
+// 많이 겹칠수록 점수가 높습니다. 이미 이 장면에 적용된 파일은 후보에서 제외합니다.
+function scoreProjectMediaForScene(entry: MediaAnalysisEntry, scene: Scene): number {
+  const haystack = `${entry.caption} ${entry.tags.join(' ')}`.toLowerCase();
+  let score = 0;
+  for (const tag of scene.tags ?? []) {
+    if (tag && haystack.includes(tag.toLowerCase())) score += 3;
+  }
+  for (const w of (scene.customTitle || '').split(/\s+/).filter((w) => w.length >= 2)) {
+    if (haystack.includes(w.toLowerCase())) score += 1;
+  }
+  return score;
+}
+
+function getProjectMediaRecommendationsForScene(
+  entries: MediaAnalysisEntry[],
+  scene: Scene,
+  excludePaths: Set<string>,
+  limit = 4
+): MediaAnalysisEntry[] {
+  return entries
+    .filter((e) => !excludePaths.has(e.path))
+    .map((e) => ({ e, score: scoreProjectMediaForScene(e, scene) }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map((s) => s.e);
+}
+
 function RecommendPanel({ scene, darkMode }: { scene: Scene; darkMode: boolean }) {
-  const { applyImageToScene } = useStore();
-  const [recs, setRecs] = useState<string[]>(() => getRecommendations(scene));
-  const [isRefreshing, setIsRefreshing] = useState(false);
-  const [appliedIdx, setAppliedIdx] = useState<number | null>(null);
+  const {
+    applyImageToScene,
+    applyLocalVideoToScene,
+    updateScene,
+    blogDirHandle,
+    blogMedia,
+    blogPosts,
+    saveDirSource,
+    saveDirHandle,
+    ensureProjectMediaAnalysis,
+    listProjectMediaFiles,
+    addFilesToProjectMedia,
+  } = useStore();
+
+  // "AI 추천 4칸" — 프로젝트 media 분석 데이터가 있으면 그것을, 없으면(폴더 미연결 등)
+  // 기존 블로그 추천으로 대체합니다.
+  const [source, setSource] = useState<'project' | 'blog' | 'none'>('none');
+  const [candidates, setCandidates] = useState<(BlogMediaMeta | MediaAnalysisEntry)[]>([]);
+  const [previewUrls, setPreviewUrls] = useState<Record<string, string>>({});
+  const [loading, setLoading] = useState(false);
+  const [appliedId, setAppliedId] = useState<string | null>(null);
+
+  // "이 장면 전용 등록" — scene.pinnedMediaPaths에 있는 파일들의 미리보기 URL.
+  const [pinnedUrls, setPinnedUrls] = useState<Record<string, string>>({});
+  const [registerBusy, setRegisterBusy] = useState<'photo' | 'video' | null>(null);
+  const [registerNotice, setRegisterNotice] = useState<string | null>(null);
+  const photoInputRef = useRef<HTMLInputElement>(null);
+  const videoInputRef = useRef<HTMLInputElement>(null);
+  const mediaFilesRef = useRef<MediaFileEntry[]>([]);
+
+  // 생성한 objectURL 중 실제로 장면에 적용된 것은 revoke하지 않도록 구분해서 관리합니다
+  // (MediaLibraryModal과 동일한 이유입니다).
+  const createdUrlsRef = useRef<string[]>([]);
+  const appliedUrlsRef = useRef<Set<string>>(new Set());
+
+  const hasRealFolder = saveDirSource === 'external' && !!saveDirHandle;
+  const pinnedPaths = scene.pinnedMediaPaths ?? [];
+
+  // ── 새로고침 대상: 4칸 추천만 다시 불러옵니다 (등록된/고정된 미디어는 그대로 둡니다) ──
+  const loadRecommendations = React.useCallback(async () => {
+    setLoading(true);
+    const usedPaths = new Set([scene.localImageName, scene.localVideoName, ...pinnedPaths].filter(Boolean) as string[]);
+
+    if (hasRealFolder) {
+      const entries = await ensureProjectMediaAnalysis();
+      const files = await listProjectMediaFiles();
+      mediaFilesRef.current = files;
+      if (entries.length > 0) {
+        const picked = getProjectMediaRecommendationsForScene(entries, scene, usedPaths, 4);
+        setSource('project');
+        setCandidates(picked);
+        const urlPairs = await Promise.all(
+          picked.map(async (entry) => {
+            const fileEntry = files.find((f) => f.path === entry.path);
+            if (!fileEntry) return [entry.path, null] as const;
+            try {
+              const url = await fileHandleToObjectUrl(fileEntry.handle);
+              createdUrlsRef.current.push(url);
+              return [entry.path, url] as const;
+            } catch {
+              return [entry.path, null] as const;
+            }
+          })
+        );
+        const map: Record<string, string> = {};
+        for (const [id, url] of urlPairs) if (url) map[id] = url;
+        setPreviewUrls(map);
+        setLoading(false);
+        return;
+      }
+    }
+
+    if (blogDirHandle && blogMedia.length > 0) {
+      const picked = getBlogRecommendationsForScene(scene, blogPosts, blogMedia, 4);
+      setSource('blog');
+      setCandidates(picked);
+      const pairs = await Promise.all(
+        picked.map(async (item) => {
+          try {
+            const url = await blogMediaPreviewUrl(blogDirHandle, item);
+            if (url) createdUrlsRef.current.push(url);
+            return [item.id, url] as const;
+          } catch {
+            return [item.id, null] as const;
+          }
+        })
+      );
+      const map: Record<string, string> = {};
+      for (const [id, url] of pairs) if (url) map[id] = url;
+      setPreviewUrls(map);
+      setLoading(false);
+      return;
+    }
+
+    setSource('none');
+    setCandidates([]);
+    setPreviewUrls({});
+    setLoading(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scene.id, scene.localImageName, scene.localVideoName, pinnedPaths.join(','), hasRealFolder, blogDirHandle, blogMedia, blogPosts]);
 
   useEffect(() => {
-    setRecs(getRecommendations(scene));
-    setAppliedIdx(null);
+    setAppliedId(null);
+    loadRecommendations();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scene.id, hasRealFolder, blogDirHandle, blogMedia]);
+
+  // "이 장면 전용 등록" 썸네일의 미리보기 URL을 준비합니다.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!hasRealFolder || pinnedPaths.length === 0) {
+        setPinnedUrls({});
+        return;
+      }
+      const files = mediaFilesRef.current.length > 0 ? mediaFilesRef.current : await listProjectMediaFiles();
+      mediaFilesRef.current = files;
+      const pairs = await Promise.all(
+        pinnedPaths.map(async (path) => {
+          const fileEntry = files.find((f) => f.path === path);
+          if (!fileEntry) return [path, null] as const;
+          try {
+            const url = await fileHandleToObjectUrl(fileEntry.handle);
+            createdUrlsRef.current.push(url);
+            appliedUrlsRef.current.add(url);
+            return [path, url] as const;
+          } catch {
+            return [path, null] as const;
+          }
+        })
+      );
+      if (cancelled) return;
+      const map: Record<string, string> = {};
+      for (const [id, url] of pairs) if (url) map[id] = url;
+      setPinnedUrls(map);
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scene.id, pinnedPaths.join(','), hasRealFolder]);
+
+  useEffect(() => {
+    // 장면이 바뀌거나 패널이 사라질 때, 적용되지 않고 미리보기로만 쓰인 URL만 정리합니다.
+    return () => {
+      createdUrlsRef.current.forEach((url) => {
+        if (!appliedUrlsRef.current.has(url)) URL.revokeObjectURL(url);
+      });
+      createdUrlsRef.current = [];
+    };
   }, [scene.id]);
 
   const handleRefresh = () => {
-    setIsRefreshing(true);
-    setTimeout(() => {
-      setRecs(getRecommendations(scene));
-      setAppliedIdx(null);
-      setIsRefreshing(false);
-    }, 600);
+    loadRecommendations();
   };
 
-  const handleApply = (url: string, idx: number) => {
-    applyImageToScene(scene.id, url, { localImageName: null, logMessage: `"${scene.customTitle}" 장면에 추천 이미지 적용` });
-    setAppliedIdx(idx);
+  const handleApplyBlog = (item: BlogMediaMeta, url: string) => {
+    appliedUrlsRef.current.add(url);
+    applyImageToScene(scene.id, url, {
+      localImageName: blogMediaFileName(item.url),
+      sourcePostId: item.postId,
+      sourceMediaId: item.id,
+      logMessage: `"${scene.customTitle}" 장면에 블로그 추천 이미지 적용`,
+    });
+    setAppliedId(item.id);
   };
+
+  const handleApplyProjectMedia = async (entry: MediaAnalysisEntry, url: string) => {
+    appliedUrlsRef.current.add(url);
+    const fileEntry = mediaFilesRef.current.find((f) => f.path === entry.path);
+    if (!fileEntry) return;
+    if (entry.kind === 'video') {
+      await applyLocalVideoToScene(scene.id, fileEntry);
+    } else {
+      applyImageToScene(scene.id, url, {
+        localImageName: entry.path,
+        logMessage: `"${scene.customTitle}" 장면에 추천 이미지 적용: ${entry.path}`,
+      });
+    }
+    setAppliedId(entry.path);
+  };
+
+  // ── "사진 등록"/"영상 등록" — 새로고침 버튼 왼쪽에 위치, 이 장면 전용으로 고정됩니다 ──
+  const handleRegisterFile = async (file: File, kind: 'photo' | 'video') => {
+    setRegisterBusy(kind);
+    setRegisterNotice(null);
+    const res = await addFilesToProjectMedia([file]);
+    setRegisterBusy(null);
+    if (!res.ok || !res.added || res.added.length === 0) {
+      setRegisterNotice(res.message ?? '등록에 실패했습니다.');
+      setTimeout(() => setRegisterNotice(null), 5000);
+      return;
+    }
+    const added = res.added[0];
+    mediaFilesRef.current = [...mediaFilesRef.current, added];
+    // 이 장면에만 표시되도록 scene.pinnedMediaPaths에 기록합니다(다른 장면에는 나타나지 않음).
+    updateScene(scene.id, { pinnedMediaPaths: [...pinnedPaths, added.path] });
+    setRegisterNotice('등록되었습니다. 아래 썸네일을 눌러 스토리보드에 넣어보세요.');
+    setTimeout(() => setRegisterNotice(null), 5000);
+  };
+
+  const slots = [0, 1, 2, 3];
 
   return (
     <div
@@ -1712,56 +2111,188 @@ function RecommendPanel({ scene, darkMode }: { scene: Scene; darkMode: boolean }
       {/* Header */}
       <div
         className={cn(
-          'px-4 py-3 border-b flex items-center justify-between shrink-0',
+          'px-4 py-3 border-b flex items-center justify-between shrink-0 gap-2',
           darkMode ? 'border-neutral-800' : 'border-neutral-200'
         )}
       >
-        <div className="flex items-center gap-2">
-          <ImageIcon className="w-4 h-4 text-emerald-500" />
-          <span className="font-semibold text-sm">비슷한 이미지 추천</span>
+        <div className="flex items-center gap-2 min-w-0">
+          <ImageIcon className="w-4 h-4 text-emerald-500 shrink-0" />
+          <span className="font-semibold text-sm truncate">비슷한 이미지 추천</span>
         </div>
-        <button
-          onClick={handleRefresh}
-          className={cn(
-            'w-7 h-7 flex items-center justify-center rounded-lg transition-colors',
-            darkMode ? 'hover:bg-neutral-800 text-neutral-400' : 'hover:bg-neutral-200 text-neutral-500'
-          )}
-        >
-          <RefreshCw className={cn('w-3.5 h-3.5', isRefreshing && 'animate-spin')} />
-        </button>
-      </div>
-
-      {/* Grid */}
-      <div className="p-4 grid grid-cols-2 gap-2">
-        {recs.map((url, i) => (
+        <div className="flex items-center gap-1 shrink-0">
+          <input
+            ref={photoInputRef}
+            type="file"
+            accept="image/*"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              e.target.value = '';
+              if (file) handleRegisterFile(file, 'photo');
+            }}
+          />
+          <input
+            ref={videoInputRef}
+            type="file"
+            accept="video/*"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              e.target.value = '';
+              if (file) handleRegisterFile(file, 'video');
+            }}
+          />
           <button
-            key={`${url}-${i}`}
-            onClick={() => handleApply(url, i)}
+            onClick={() => photoInputRef.current?.click()}
+            disabled={registerBusy !== null}
+            title="사진 등록 (이 장면 전용)"
             className={cn(
-              'aspect-square rounded-xl overflow-hidden relative group ring-2 transition-all duration-150',
-              appliedIdx === i ? 'ring-indigo-500' : 'ring-transparent hover:ring-indigo-400'
+              'w-7 h-7 flex items-center justify-center rounded-lg transition-colors disabled:opacity-50',
+              darkMode ? 'hover:bg-neutral-800 text-neutral-400' : 'hover:bg-neutral-200 text-neutral-500'
             )}
           >
-            <img src={url} alt="추천 이미지" className="w-full h-full object-cover bg-neutral-200" />
-            <div
+            {registerBusy === 'photo' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ImageIcon className="w-3.5 h-3.5" />}
+          </button>
+          <button
+            onClick={() => videoInputRef.current?.click()}
+            disabled={registerBusy !== null}
+            title="영상 등록 (이 장면 전용)"
+            className={cn(
+              'w-7 h-7 flex items-center justify-center rounded-lg transition-colors disabled:opacity-50',
+              darkMode ? 'hover:bg-neutral-800 text-neutral-400' : 'hover:bg-neutral-200 text-neutral-500'
+            )}
+          >
+            {registerBusy === 'video' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Video className="w-3.5 h-3.5" />}
+          </button>
+          <button
+            onClick={handleRefresh}
+            disabled={loading}
+            title="추천 이미지 4개 새로고침"
+            className={cn(
+              'w-7 h-7 flex items-center justify-center rounded-lg transition-colors disabled:opacity-50',
+              darkMode ? 'hover:bg-neutral-800 text-neutral-400' : 'hover:bg-neutral-200 text-neutral-500'
+            )}
+          >
+            <RefreshCw className={cn('w-3.5 h-3.5', loading && 'animate-spin')} />
+          </button>
+        </div>
+      </div>
+      {registerNotice && (
+        <p className={cn('px-4 pt-2 text-[11px] leading-relaxed', darkMode ? 'text-neutral-400' : 'text-neutral-500')}>
+          {registerNotice}
+        </p>
+      )}
+
+      {/* 이 장면 전용으로 등록한 사진/영상 — 다른 장면의 추천 패널에는 나타나지 않습니다.
+          새로고침을 눌러도 이 영역은 그대로 유지됩니다. */}
+      {pinnedPaths.length > 0 && (
+        <div className="px-4 pt-3 grid grid-cols-2 gap-2">
+          {pinnedPaths.map((path) => {
+            const url = pinnedUrls[path];
+            const entry = mediaFilesRef.current.find((f) => f.path === path);
+            const isApplied = appliedId === path || scene.localImageName === path || scene.localVideoName === path;
+            if (!url) return null;
+            return (
+              <button
+                key={path}
+                onClick={() =>
+                  handleApplyProjectMedia(
+                    { path, kind: entry?.kind ?? 'image', tags: [], caption: '', size: 0, lastModified: 0, analyzedAt: '' },
+                    url
+                  )
+                }
+                className={cn(
+                  'aspect-square rounded-xl overflow-hidden relative group ring-2 transition-all duration-150',
+                  isApplied ? 'ring-indigo-500' : 'ring-transparent hover:ring-indigo-400'
+                )}
+              >
+                {entry?.kind === 'video' ? (
+                  <video src={url} className="w-full h-full object-cover bg-neutral-800" muted />
+                ) : (
+                  <img src={url} alt={path} className="w-full h-full object-cover bg-neutral-200" />
+                )}
+                <div className="absolute top-1 left-1 flex items-center gap-0.5 bg-black/60 text-white text-[9px] px-1.5 py-0.5 rounded-full backdrop-blur-sm">
+                  <Pin className="w-2.5 h-2.5" /> 등록됨
+                </div>
+                <div
+                  className={cn(
+                    'absolute inset-0 flex items-center justify-center transition-opacity',
+                    isApplied ? 'bg-indigo-500/30 opacity-100' : 'bg-black/30 opacity-0 group-hover:opacity-100'
+                  )}
+                >
+                  {isApplied ? (
+                    <Check className="w-5 h-5 text-white drop-shadow" />
+                  ) : (
+                    <span className="text-white text-xs font-medium bg-black/50 px-2 py-0.5 rounded-full backdrop-blur-sm">
+                      넣기
+                    </span>
+                  )}
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      {/* AI 추천 4칸 — 프로젝트 media 분석 데이터(media_analysis.json) 기반, 없으면 블로그 기반 */}
+      <div className="p-4 grid grid-cols-2 gap-2">
+        {slots.map((i) => {
+          const item = candidates[i];
+          const id = item ? ('id' in item ? item.id : item.path) : undefined;
+          const url = id ? previewUrls[id] : undefined;
+          if (!item || !url) {
+            return (
+              <div
+                key={i}
+                className={cn(
+                  'aspect-square rounded-xl flex flex-col items-center justify-center gap-1 border border-dashed',
+                  darkMode ? 'border-neutral-700 text-neutral-600' : 'border-neutral-300 text-neutral-400'
+                )}
+              >
+                <ImageOff className="w-5 h-5" />
+                <span className="text-[10px] text-center px-1">{loading ? '불러오는 중...' : '추천 이미지 없음'}</span>
+              </div>
+            );
+          }
+          const isApplied = appliedId === id;
+          const isProjectMedia = 'analyzedAt' in item;
+          return (
+            <button
+              key={id}
+              onClick={() => (isProjectMedia ? handleApplyProjectMedia(item as MediaAnalysisEntry, url) : handleApplyBlog(item as BlogMediaMeta, url))}
               className={cn(
-                'absolute inset-0 flex items-center justify-center transition-opacity',
-                appliedIdx === i
-                  ? 'bg-indigo-500/30 opacity-100'
-                  : 'bg-black/30 opacity-0 group-hover:opacity-100'
+                'aspect-square rounded-xl overflow-hidden relative group ring-2 transition-all duration-150',
+                isApplied ? 'ring-indigo-500' : 'ring-transparent hover:ring-indigo-400'
               )}
             >
-              {appliedIdx === i ? (
-                <Check className="w-5 h-5 text-white drop-shadow" />
+              {isProjectMedia && (item as MediaAnalysisEntry).kind === 'video' ? (
+                <video src={url} className="w-full h-full object-cover bg-neutral-800" muted />
               ) : (
-                <span className="text-white text-xs font-medium bg-black/50 px-2 py-0.5 rounded-full backdrop-blur-sm">
-                  교체
-                </span>
+                <img src={url} alt="추천 이미지" className="w-full h-full object-cover bg-neutral-200" />
               )}
-            </div>
-          </button>
-        ))}
+              <div
+                className={cn(
+                  'absolute inset-0 flex items-center justify-center transition-opacity',
+                  isApplied ? 'bg-indigo-500/30 opacity-100' : 'bg-black/30 opacity-0 group-hover:opacity-100'
+                )}
+              >
+                {isApplied ? (
+                  <Check className="w-5 h-5 text-white drop-shadow" />
+                ) : (
+                  <span className="text-white text-xs font-medium bg-black/50 px-2 py-0.5 rounded-full backdrop-blur-sm">
+                    교체
+                  </span>
+                )}
+              </div>
+            </button>
+          );
+        })}
       </div>
+      {source === 'none' && (
+        <p className={cn('px-4 -mt-2 pb-2 text-[11px] leading-relaxed', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>
+          저장 폴더에 사진/영상을 등록하거나 블로그 폴더를 연결하면 이 장면과 어울리는 것을 추천해드려요.
+        </p>
+      )}
 
       {/* Scene info */}
       <div className={cn('px-4 pb-4 border-t pt-4', darkMode ? 'border-neutral-800' : 'border-neutral-200')}>
@@ -1860,10 +2391,16 @@ function NewProjectModal({ darkMode, onClose }: { darkMode: boolean; onClose: ()
   const handleConnect = async () => {
     setConnecting(true);
     setErrorMsg(null);
-    const res = await connectSaveFolder();
-    setConnecting(false);
-    if (!res.ok && res.message && res.message !== '폴더 선택이 취소되었습니다.') {
-      setErrorMsg(res.message);
+    try {
+      const res = await connectSaveFolder();
+      if (!res.ok && res.message && res.message !== '폴더 선택이 취소되었습니다.') {
+        setErrorMsg(res.message);
+      }
+    } catch (err) {
+      console.error(err);
+      setErrorMsg('폴더를 연결하는 중 예기치 못한 오류가 발생했습니다.');
+    } finally {
+      setConnecting(false);
     }
   };
 
@@ -2000,21 +2537,131 @@ function NewProjectModal({ darkMode, onClose }: { darkMode: boolean; onClose: ()
   );
 }
 
+// ─── 가져오기 허브 모달 (2026-07-27(3) 신설) ───────────────────────────────────
+//
+// 요청사항: "불러오기와 미디어라이브러리와 블로그에서 가져오기는 같은 버튼 하나로
+// 진행가능하게 하자." 헤더를 깔끔하게 유지하기 위해, 세 기능을 각각 별도 버튼으로
+// 두지 않고 이 허브 모달에서 카드 형태로 골라 들어가도록 통합했습니다. 각 기능이
+// 실제로 무엇을 필요로 하는지(저장 폴더 연결 여부 등)도 카드에 바로 보여줘서,
+// 들어가서야 "폴더를 연결하세요"를 보고 다시 나오는 일을 줄입니다.
+function ImportHubModal({
+  darkMode,
+  onClose,
+  onPick,
+}: {
+  darkMode: boolean;
+  onClose: () => void;
+  onPick: (target: 'load' | 'media' | 'blog-import') => void;
+}) {
+  const { saveDirHandle, saveDirName, saveDirSource, blogDirHandle, blogDirName } = useStore();
+  const hasRealFolder = saveDirSource === 'external' && !!saveDirHandle;
+  const modalBg = darkMode ? 'bg-neutral-900 border-neutral-800' : 'bg-white border-neutral-200';
+
+  const cards: {
+    target: 'load' | 'media' | 'blog-import';
+    icon: React.ReactNode;
+    title: string;
+    desc: string;
+    status: { ok: boolean; text: string };
+  }[] = [
+    {
+      target: 'load',
+      icon: <FolderOpen className="w-5 h-5 text-indigo-500" />,
+      title: '프로젝트 불러오기',
+      desc: '저장 폴더(또는 다른 폴더)에 저장해둔 프로젝트를 불러옵니다.',
+      status: hasRealFolder
+        ? { ok: true, text: `"${saveDirName}" 폴더의 프로젝트를 바로 불러올 수 있습니다` }
+        : { ok: true, text: '저장 폴더가 없어도 "다른 폴더에서 불러오기"로 바로 사용 가능' },
+    },
+    {
+      target: 'media',
+      icon: <ImageIcon className="w-5 h-5 text-emerald-500" />,
+      title: '미디어 라이브러리',
+      desc: '등록해둔 사진·영상을 골라 장면에 적용하거나, 새 파일을 등록합니다.',
+      status: hasRealFolder
+        ? { ok: true, text: '실제 저장 폴더가 연결되어 있어 바로 사용 가능' }
+        : { ok: false, text: '실제 저장 폴더를 먼저 연결해야 사용할 수 있습니다' },
+    },
+    {
+      target: 'blog-import',
+      icon: <Newspaper className="w-5 h-5 text-amber-500" />,
+      title: '블로그에서 가져오기',
+      desc: '블로그 데이터 폴더(posts.json 등)를 연결해 글을 스토리보드로 만듭니다.',
+      status: blogDirHandle
+        ? { ok: true, text: `"${blogDirName}" 폴더에 연결되어 있습니다` }
+        : { ok: true, text: '눌러서 블로그 데이터 폴더를 먼저 연결하세요' },
+    },
+  ];
+
+  return (
+    <ModalBackdrop onClose={onClose}>
+      <div className={cn('w-full max-w-xl rounded-2xl border shadow-2xl', modalBg)}>
+        <div className={cn('flex items-center justify-between px-6 py-4 border-b', darkMode ? 'border-neutral-800' : 'border-neutral-200')}>
+          <div className="flex items-center gap-2">
+            <Upload className="w-5 h-5 text-indigo-500" />
+            <h2 className="font-bold text-base">가져오기</h2>
+          </div>
+          <button onClick={onClose} className={cn('w-7 h-7 flex items-center justify-center rounded-lg', darkMode ? 'hover:bg-neutral-800' : 'hover:bg-neutral-100')}>
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+        <div className="p-5 space-y-3">
+          {cards.map((c) => (
+            <button
+              key={c.target}
+              onClick={() => onPick(c.target)}
+              className={cn(
+                'w-full text-left flex items-start gap-3 p-4 rounded-xl border transition-colors',
+                darkMode
+                  ? 'border-neutral-800 hover:border-neutral-700 hover:bg-neutral-800/60'
+                  : 'border-neutral-200 hover:border-neutral-300 hover:bg-neutral-50'
+              )}
+            >
+              <div className="shrink-0 mt-0.5">{c.icon}</div>
+              <div className="min-w-0 flex-1">
+                <p className="font-semibold text-sm">{c.title}</p>
+                <p className={cn('text-xs mt-0.5', darkMode ? 'text-neutral-400' : 'text-neutral-500')}>{c.desc}</p>
+                <p className={cn('text-xs mt-1.5 flex items-center gap-1', c.status.ok ? 'text-emerald-500' : 'text-amber-500')}>
+                  {c.status.ok ? <Check className="w-3 h-3" /> : <AlertCircle className="w-3 h-3" />}
+                  {c.status.text}
+                </p>
+              </div>
+            </button>
+          ))}
+        </div>
+      </div>
+    </ModalBackdrop>
+  );
+}
+
 // ─── Load Modal ───────────────────────────────────────────────────────────────
 
-function LoadModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => void }) {
-  const { savedProjects, saveDirHandle, saveDirName, listNamedProjects, loadNamedProject, setCurrentProject, setView } = useStore();
-  const [selected, setSelected] = useState<string | null>(null);
+/** "다른 폴더에서 불러오기"용 JSON 파일 미리보기 — 파일명/원문 JSON을 그대로 보여주지 않고
+ *  프로젝트 카드(썸네일/이름/장면 수/수정일)로 예쁘게 파싱해서 보여주기 위한 타입입니다. */
+interface FolderProjectPreview {
+  name: string;
+  handle: any;
+  title: string;
+  sceneCount: number | null;
+  modifiedAt: string | null;
+  thumbnail?: string;
+  valid: boolean;
+}
+
+function LoadModal({ darkMode, onClose, onBack }: { darkMode: boolean; onClose: () => void; onBack?: () => void }) {
+  const { saveDirHandle, saveDirName, listNamedProjects, loadNamedProject, deleteNamedProject, setCurrentProject, setView } = useStore();
   const [fsSupported, setFsSupported] = useState(false);
 
   // 연결된 저장 폴더의 projects/ 목록
   const [namedProjects, setNamedProjects] = useState<{ name: string; handle: any; modifiedAt?: string; sceneCount?: number }[]>([]);
   const [loadingList, setLoadingList] = useState(false);
   const [loadingNamed, setLoadingNamed] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [deletingName, setDeletingName] = useState<string | null>(null);
 
   // 임의 폴더에서 불러오기 (저장 폴더 연결 없이도 사용 가능한 보조 기능)
   const [folderName, setFolderName] = useState<string | null>(null);
-  const [folderFiles, setFolderFiles] = useState<{ name: string; handle: any }[]>([]);
+  const [folderProjects, setFolderProjects] = useState<FolderProjectPreview[]>([]);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [browsingFolder, setBrowsingFolder] = useState(false);
   const [loadingFile, setLoadingFile] = useState(false);
@@ -2024,7 +2671,7 @@ function LoadModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => vo
     setFsSupported(isFileSystemAccessSupported());
   }, []);
 
-  useEffect(() => {
+  const refreshNamedProjects = () => {
     if (!saveDirHandle) {
       setNamedProjects([]);
       return;
@@ -2033,6 +2680,11 @@ function LoadModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => vo
     listNamedProjects()
       .then(setNamedProjects)
       .finally(() => setLoadingList(false));
+  };
+
+  useEffect(() => {
+    refreshNamedProjects();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [saveDirHandle, listNamedProjects]);
 
   const handleLoadNamed = async (proj: { name: string; handle: any }) => {
@@ -2048,12 +2700,17 @@ function LoadModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => vo
     onClose();
   };
 
-  const handleLoadSample = () => {
-    const proj = savedProjects.find((p) => p.id === selected);
-    if (!proj) return;
-    setCurrentProject(proj);
-    setView('editor');
-    onClose();
+  const handleDeleteNamed = async (name: string) => {
+    setDeletingName(name);
+    setErrorMsg(null);
+    const res = await deleteNamedProject(name);
+    setDeletingName(null);
+    setConfirmDelete(null);
+    if (!res.ok) {
+      setErrorMsg(res.message ?? '프로젝트를 삭제하는 중 문제가 발생했습니다.');
+      return;
+    }
+    refreshNamedProjects();
   };
 
   const handlePickFolder = async () => {
@@ -2068,10 +2725,35 @@ function LoadModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => vo
       }
       const files = await listJsonFiles(handle);
       setFolderName(handle.name);
-      setFolderFiles(files);
       if (files.length === 0) {
+        setFolderProjects([]);
         setErrorMsg('선택한 폴더에서 프로젝트 JSON 파일을 찾지 못했습니다.');
+        return;
       }
+      // 2026-07-27(2): 파일명/원문 JSON을 그대로 보여주지 않고, 각 파일을 미리 읽어
+      // 이름/장면 수/썸네일/수정일이 있는 예쁜 카드로 보여줍니다.
+      const previews = await Promise.all(
+        files.map(async (f): Promise<FolderProjectPreview> => {
+          try {
+            const data = await readJsonFile(f.handle);
+            if (!data || !Array.isArray(data.scenes)) {
+              return { name: f.name, handle: f.handle, title: f.name.replace(/\.json$/i, ''), sceneCount: null, modifiedAt: null, valid: false };
+            }
+            return {
+              name: f.name,
+              handle: f.handle,
+              title: typeof data.name === 'string' && data.name.trim() ? data.name : f.name.replace(/\.json$/i, ''),
+              sceneCount: data.scenes.length,
+              modifiedAt: typeof data.modifiedAt === 'string' ? data.modifiedAt : null,
+              thumbnail: typeof data.thumbnail === 'string' ? data.thumbnail : data.scenes[0]?.photoRef,
+              valid: true,
+            };
+          } catch {
+            return { name: f.name, handle: f.handle, title: f.name.replace(/\.json$/i, ''), sceneCount: null, modifiedAt: null, valid: false };
+          }
+        })
+      );
+      setFolderProjects(previews);
     } catch (err) {
       console.error(err);
       setErrorMsg('폴더를 여는 중 문제가 발생했습니다. 폴더 접근 권한을 확인해주세요.');
@@ -2086,7 +2768,7 @@ function LoadModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => vo
     try {
       const data = await readJsonFile(fileEntry.handle);
       if (!data || !Array.isArray(data.scenes)) {
-        setErrorMsg('올바른 프로젝트 파일 형식이 아닙니다 (scenes 배열이 없습니다).');
+        setErrorMsg('올바른 프로젝트 파일 형식이 아닙니다 (장면 목록이 없습니다).');
         return;
       }
       const now = new Date().toISOString();
@@ -2104,7 +2786,7 @@ function LoadModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => vo
       onClose();
     } catch (err) {
       console.error(err);
-      setErrorMsg('파일을 읽는 중 문제가 발생했습니다. 올바른 JSON 파일인지 확인해주세요.');
+      setErrorMsg('파일을 읽는 중 문제가 발생했습니다. 올바른 프로젝트 파일인지 확인해주세요.');
     } finally {
       setLoadingFile(false);
     }
@@ -2117,6 +2799,15 @@ function LoadModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => vo
       <div className={cn('w-full max-w-2xl max-h-[85vh] overflow-y-auto scrollbar-hide rounded-2xl border shadow-2xl', modalBg)}>
         <div className={cn('flex items-center justify-between px-6 py-4 border-b sticky top-0 z-10', modalBg, darkMode ? 'border-neutral-800' : 'border-neutral-200')}>
           <div className="flex items-center gap-2">
+            {onBack && (
+              <button
+                onClick={onBack}
+                title="가져오기 목록으로"
+                className={cn('w-7 h-7 -ml-1 flex items-center justify-center rounded-lg shrink-0', darkMode ? 'hover:bg-neutral-800' : 'hover:bg-neutral-100')}
+              >
+                <ArrowLeft className="w-4 h-4" />
+              </button>
+            )}
             <FolderOpen className="w-5 h-5 text-indigo-500" />
             <h2 className="font-bold text-base">프로젝트 불러오기</h2>
           </div>
@@ -2147,30 +2838,62 @@ function LoadModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => vo
             ) : (
               <div className="space-y-1.5 max-h-52 overflow-y-auto scrollbar-hide">
                 {namedProjects.map((proj) => (
-                  <button
+                  <div
                     key={proj.name}
-                    onClick={() => handleLoadNamed(proj)}
-                    disabled={loadingNamed === proj.name}
                     className={cn(
-                      'w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg border text-left text-xs transition-colors disabled:opacity-50',
-                      darkMode ? 'border-neutral-700 hover:border-indigo-500 bg-neutral-900/60' : 'border-neutral-200 hover:border-indigo-300 bg-white'
+                      'w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg border text-left text-xs transition-colors',
+                      darkMode ? 'border-neutral-700 bg-neutral-900/60' : 'border-neutral-200 bg-white'
                     )}
                   >
-                    {loadingNamed === proj.name ? (
-                      <Loader2 className="w-3.5 h-3.5 shrink-0 animate-spin text-indigo-500" />
+                    <button
+                      onClick={() => handleLoadNamed(proj)}
+                      disabled={loadingNamed === proj.name}
+                      className="flex items-center gap-2.5 flex-1 min-w-0 disabled:opacity-50"
+                    >
+                      {loadingNamed === proj.name ? (
+                        <Loader2 className="w-3.5 h-3.5 shrink-0 animate-spin text-indigo-500" />
+                      ) : (
+                        <FileText className="w-3.5 h-3.5 shrink-0 text-indigo-500" />
+                      )}
+                      <span className="truncate font-mono flex-1 text-left">{proj.name.replace(/\.json$/i, '')}</span>
+                      {typeof proj.sceneCount === 'number' && (
+                        <span className={cn('shrink-0', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>{proj.sceneCount}개 장면</span>
+                      )}
+                      {proj.modifiedAt && (
+                        <span className={cn('shrink-0', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>
+                          {formatShortDateTime(proj.modifiedAt)}
+                        </span>
+                      )}
+                    </button>
+                    {confirmDelete === proj.name ? (
+                      <div className="flex items-center gap-1 shrink-0">
+                        <button
+                          onClick={() => handleDeleteNamed(proj.name)}
+                          disabled={deletingName === proj.name}
+                          className="px-2 py-1 rounded-md bg-rose-600 text-white hover:bg-rose-700 text-[11px] font-semibold"
+                        >
+                          {deletingName === proj.name ? <Loader2 className="w-3 h-3 animate-spin" /> : '삭제 확정'}
+                        </button>
+                        <button
+                          onClick={() => setConfirmDelete(null)}
+                          className={cn('px-2 py-1 rounded-md text-[11px]', darkMode ? 'text-neutral-400 hover:bg-neutral-800' : 'text-neutral-500 hover:bg-neutral-100')}
+                        >
+                          취소
+                        </button>
+                      </div>
                     ) : (
-                      <FileText className="w-3.5 h-3.5 shrink-0 text-indigo-500" />
+                      <button
+                        onClick={() => setConfirmDelete(proj.name)}
+                        title="이 프로젝트 삭제"
+                        className={cn(
+                          'shrink-0 w-6 h-6 flex items-center justify-center rounded-md transition-colors',
+                          darkMode ? 'text-neutral-500 hover:bg-rose-500/10 hover:text-rose-400' : 'text-neutral-400 hover:bg-rose-50 hover:text-rose-500'
+                        )}
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
                     )}
-                    <span className="truncate font-mono flex-1">{proj.name.replace(/\.json$/i, '')}</span>
-                    {typeof proj.sceneCount === 'number' && (
-                      <span className={cn('shrink-0', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>{proj.sceneCount}개 장면</span>
-                    )}
-                    {proj.modifiedAt && (
-                      <span className={cn('shrink-0', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>
-                        {formatShortDateTime(proj.modifiedAt)}
-                      </span>
-                    )}
-                  </button>
+                  </div>
                 ))}
               </div>
             )}
@@ -2202,7 +2925,7 @@ function LoadModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => vo
 
             {!fsSupported && (
               <p className={cn('text-xs', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>
-                이 브라우저는 폴더 선택을 지원하지 않아요(Chrome/Edge 권장). 아래 샘플 프로젝트를 이용해주세요.
+                이 브라우저는 폴더 선택을 지원하지 않아요(Chrome/Edge 권장).
               </p>
             )}
 
@@ -2210,33 +2933,56 @@ function LoadModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => vo
               <div className={cn('mt-2 rounded-xl border p-3', darkMode ? 'border-neutral-800 bg-neutral-800/40' : 'border-neutral-200 bg-neutral-50')}>
                 <p className={cn('text-xs mb-2 flex items-center gap-1.5', darkMode ? 'text-neutral-400' : 'text-neutral-500')}>
                   <Folder className="w-3.5 h-3.5" />
-                  "{folderName}" 폴더 — JSON 파일 {folderFiles.length}개
+                  "{folderName}" 폴더 — 프로젝트 {folderProjects.length}개
                 </p>
-                {folderFiles.length > 0 && (
-                  <div className="space-y-1.5 max-h-40 overflow-y-auto scrollbar-hide">
-                    {folderFiles.map((f) => (
+                {folderProjects.length > 0 && (
+                  <div className="space-y-2 max-h-64 overflow-y-auto scrollbar-hide">
+                    {folderProjects.map((proj) => (
                       <button
-                        key={f.name}
+                        key={proj.name}
                         onClick={() => {
-                          setSelectedFile(f.name);
-                          handleLoadFromFolderFile(f);
+                          if (!proj.valid) return;
+                          setSelectedFile(proj.name);
+                          handleLoadFromFolderFile(proj);
                         }}
-                        disabled={loadingFile}
+                        disabled={loadingFile || !proj.valid}
                         className={cn(
-                          'w-full flex items-center gap-2 px-3 py-2 rounded-lg border text-left text-xs transition-colors disabled:opacity-50',
-                          selectedFile === f.name
+                          'w-full flex items-center gap-3 p-2.5 rounded-lg border text-left transition-colors disabled:opacity-50',
+                          selectedFile === proj.name
                             ? 'border-indigo-500 bg-indigo-50 dark:bg-indigo-500/10'
                             : darkMode
                             ? 'border-neutral-700 hover:border-neutral-600 bg-neutral-900/60'
                             : 'border-neutral-200 hover:border-neutral-300 bg-white'
                         )}
                       >
-                        {loadingFile && selectedFile === f.name ? (
-                          <Loader2 className="w-3.5 h-3.5 shrink-0 animate-spin text-indigo-500" />
-                        ) : (
-                          <FileText className="w-3.5 h-3.5 shrink-0 text-indigo-500" />
-                        )}
-                        <span className="truncate font-mono">{f.name}</span>
+                        <div className="w-16 h-10 rounded-md overflow-hidden shrink-0 bg-neutral-200">
+                          {proj.valid ? (
+                            <img src={getSceneImageSrc(proj.thumbnail)} alt={proj.title} className="w-full h-full object-cover" />
+                          ) : (
+                            <div className="w-full h-full flex items-center justify-center">
+                              <ImageOff className="w-4 h-4 text-neutral-400" />
+                            </div>
+                          )}
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <p className="text-xs font-semibold truncate flex items-center gap-1.5">
+                            {loadingFile && selectedFile === proj.name && <Loader2 className="w-3 h-3 animate-spin text-indigo-500" />}
+                            {proj.title}
+                          </p>
+                          {proj.valid ? (
+                            <div className={cn('flex gap-2 mt-0.5 text-[11px]', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>
+                              <span>{proj.sceneCount}개 장면</span>
+                              {proj.modifiedAt && (
+                                <>
+                                  <span>·</span>
+                                  <span>수정: {formatShortDateTime(proj.modifiedAt)}</span>
+                                </>
+                              )}
+                            </div>
+                          ) : (
+                            <p className="text-[11px] text-rose-400 mt-0.5">프로젝트 형식이 아닌 파일입니다</p>
+                          )}
+                        </div>
                       </button>
                     ))}
                   </div>
@@ -2251,58 +2997,11 @@ function LoadModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => vo
               </div>
             )}
           </div>
-
-          {/* 샘플 프로젝트 (데모) */}
-          <div>
-            <p className={cn('text-xs mb-2 font-semibold text-indigo-500')}>
-              샘플 프로젝트 (데모용, 실제 파일 아님) — {savedProjects.length}개
-            </p>
-            <div className="space-y-2 max-h-64 overflow-y-auto scrollbar-hide">
-              {savedProjects.map((proj) => (
-                <button
-                  key={proj.id}
-                  onClick={() => setSelected(proj.id)}
-                  className={cn(
-                    'w-full flex items-center gap-4 p-3 rounded-xl border text-left transition-all',
-                    selected === proj.id
-                      ? 'border-indigo-500 bg-indigo-50 dark:bg-indigo-500/10'
-                      : darkMode
-                      ? 'border-neutral-800 bg-neutral-800/40 hover:border-neutral-600'
-                      : 'border-neutral-200 bg-neutral-50 hover:border-neutral-300'
-                  )}
-                >
-                  <div className="w-20 h-12 rounded-lg overflow-hidden shrink-0 bg-neutral-200">
-                    <img src={getSceneImageSrc(proj.thumbnail)} alt={proj.name} className="w-full h-full object-cover" />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="font-semibold text-sm truncate">{proj.name}</p>
-                    <p className={cn('text-xs mt-0.5 truncate font-mono', darkMode ? 'text-neutral-500' : 'text-neutral-400')} title={proj.folderPath}>
-                      {proj.folderPath}
-                    </p>
-                    <div className={cn('flex gap-3 mt-1 text-xs', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>
-                      <span>{proj.scenes.length}개 장면</span>
-                      <span>·</span>
-                      <span>수정: {new Date(proj.modifiedAt).toLocaleDateString('ko-KR')}</span>
-                    </div>
-                  </div>
-                  {selected === proj.id && <Check className="w-4 h-4 text-indigo-500 shrink-0" />}
-                </button>
-              ))}
-            </div>
-          </div>
         </div>
 
         <div className={cn('px-6 py-4 border-t flex justify-end gap-2 sticky bottom-0', modalBg, darkMode ? 'border-neutral-800' : 'border-neutral-200')}>
           <button onClick={onClose} className={cn('px-4 py-2 text-sm rounded-lg transition-colors', darkMode ? 'hover:bg-neutral-800 text-neutral-400' : 'hover:bg-neutral-100 text-neutral-500')}>
-            취소
-          </button>
-          <button
-            onClick={handleLoadSample}
-            disabled={!selected}
-            className="px-5 py-2 text-sm bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-colors flex items-center gap-1.5"
-          >
-            <Upload className="w-4 h-4" />
-            샘플 불러오기
+            닫기
           </button>
         </div>
       </div>
@@ -2983,7 +3682,7 @@ function SettingsModal({ darkMode, onClose }: { darkMode: boolean; onClose: () =
 
 // ─── Blog Import Modal (블로그 데이터 폴더에서 글/사진 가져오기) ────────────────────
 
-function BlogImportModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => void }) {
+function BlogImportModal({ darkMode, onClose, onBack }: { darkMode: boolean; onClose: () => void; onBack?: () => void }) {
   const {
     blogDirHandle,
     blogDirName,
@@ -3051,9 +3750,15 @@ function BlogImportModal({ darkMode, onClose }: { darkMode: boolean; onClose: ()
   const handleConnect = async () => {
     setBusy(true);
     setNotice(null);
-    const res = await connectBlogDataFolder();
-    setBusy(false);
-    setNotice({ tone: res.ok ? 'ok' : 'error', text: res.message ?? '' });
+    try {
+      const res = await connectBlogDataFolder();
+      setNotice({ tone: res.ok ? 'ok' : 'error', text: res.message ?? '' });
+    } catch (err) {
+      console.error(err);
+      setNotice({ tone: 'error', text: '폴더를 연결하는 중 예기치 못한 오류가 발생했습니다.' });
+    } finally {
+      setBusy(false);
+    }
   };
 
   const toggle = (id: string) => {
@@ -3078,6 +3783,10 @@ function BlogImportModal({ darkMode, onClose }: { darkMode: boolean; onClose: ()
         `다음 블로그 글을 참고해서 영상을 만들어줘:\n${summary}`
       );
     }
+    // 2026-07-27: "채팅으로 가져오기"를 누르면 메시지만 채팅 기록에 추가되고 화면은 그대로
+    // 블로그 가져오기 모달/편집기에 머물러 있어 사용자가 방금 보낸 메시지를 못 보는 문제가 있었습니다.
+    // 채팅 화면으로 자동 전환하도록 수정.
+    setView('chat');
     onClose();
   };
 
@@ -3231,6 +3940,15 @@ function BlogImportModal({ darkMode, onClose }: { darkMode: boolean; onClose: ()
       <div className={cn('w-full max-w-2xl rounded-2xl border shadow-2xl max-h-[85vh] flex flex-col', modalBg)}>
         <div className={cn('shrink-0 flex items-center justify-between px-6 py-4 border-b', darkMode ? 'border-neutral-800' : 'border-neutral-200')}>
           <div className="flex items-center gap-2">
+            {onBack && (
+              <button
+                onClick={onBack}
+                title="가져오기 목록으로"
+                className={cn('w-7 h-7 -ml-1 flex items-center justify-center rounded-lg shrink-0', darkMode ? 'hover:bg-neutral-800' : 'hover:bg-neutral-100')}
+              >
+                <ArrowLeft className="w-4 h-4" />
+              </button>
+            )}
             <Newspaper className="w-5 h-5 text-sky-500" />
             <h2 className="font-bold text-base">블로그에서 가져오기</h2>
           </div>
@@ -3410,11 +4128,14 @@ function BlogImportModal({ darkMode, onClose }: { darkMode: boolean; onClose: ()
 
 const MAX_MEDIA_ITEMS = 60;
 
-function MediaLibraryModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => void }) {
+function MediaLibraryModal({ darkMode, onClose, onBack }: { darkMode: boolean; onClose: () => void; onBack?: () => void }) {
   const {
-    mediaDirHandle,
-    mediaDirName,
-    connectMediaFolder,
+    saveDirHandle,
+    saveDirSource,
+    currentProject,
+    connectSaveFolder,
+    listProjectMediaFiles,
+    addFilesToProjectMedia,
     scenes,
     selectedSceneId,
     applyImageToScene,
@@ -3430,10 +4151,13 @@ function MediaLibraryModal({ darkMode, onClose }: { darkMode: boolean; onClose: 
     pushEditLog,
   } = useStore();
 
+  const hasRealFolder = saveDirSource === 'external' && !!saveDirHandle;
+
   const [items, setItems] = useState<MediaFileEntry[]>([]);
   const [thumbUrls, setThumbUrls] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(false);
   const [connecting, setConnecting] = useState(false);
+  const [registering, setRegistering] = useState(false);
   const [applyingPath, setApplyingPath] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [filter, setFilter] = useState<'all' | 'image' | 'video'>('all');
@@ -3442,6 +4166,7 @@ function MediaLibraryModal({ darkMode, onClose }: { darkMode: boolean; onClose: 
   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
   const [building, setBuilding] = useState(false);
   const [buildStage, setBuildStage] = useState('');
+  const fileInputRef = useRef<HTMLInputElement>(null);
   // 생성한 objectURL을 모두 누적해두었다가, 모달이 닫힐 때 한 번에 정리합니다.
   // (state를 클로저로 참조하면 마지막 값이 아닌 최초 렌더 시점 값을 참조하게 되므로 ref를 사용합니다)
   const createdUrlsRef = useRef<string[]>([]);
@@ -3454,15 +4179,15 @@ function MediaLibraryModal({ darkMode, onClose }: { darkMode: boolean; onClose: 
 
   const selectedScene = scenes.find((s) => s.id === selectedSceneId) ?? scenes[0] ?? null;
 
-  useEffect(() => {
-    if (!mediaDirHandle) {
+  const reloadItems = React.useCallback(() => {
+    if (!hasRealFolder) {
       setItems([]);
       return;
     }
     let cancelled = false;
     setLoading(true);
     setErrorMsg(null);
-    listMediaFiles(mediaDirHandle)
+    listProjectMediaFiles()
       .then(async (files) => {
         if (cancelled) return;
         const limited = files.slice(0, MAX_MEDIA_ITEMS);
@@ -3489,7 +4214,7 @@ function MediaLibraryModal({ darkMode, onClose }: { darkMode: boolean; onClose: 
       })
       .catch((err) => {
         console.error(err);
-        if (!cancelled) setErrorMsg('미디어 폴더를 읽는 중 문제가 발생했습니다.');
+        if (!cancelled) setErrorMsg('미디어를 불러오는 중 문제가 발생했습니다.');
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -3497,7 +4222,13 @@ function MediaLibraryModal({ darkMode, onClose }: { darkMode: boolean; onClose: 
     return () => {
       cancelled = true;
     };
-  }, [mediaDirHandle]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasRealFolder, currentProject?.name]);
+
+  useEffect(() => {
+    const cleanup = reloadItems();
+    return cleanup;
+  }, [reloadItems]);
 
   useEffect(() => {
     // 모달이 닫힐 때(언마운트 시) 그동안 생성해둔 objectURL 중, 실제로 장면에 적용되지 않고
@@ -3513,11 +4244,31 @@ function MediaLibraryModal({ darkMode, onClose }: { darkMode: boolean; onClose: 
   const handleConnect = async () => {
     setConnecting(true);
     setErrorMsg(null);
-    const res = await connectMediaFolder();
-    setConnecting(false);
-    if (!res.ok && res.message && res.message !== '폴더 선택이 취소되었습니다.') {
-      setErrorMsg(res.message);
+    try {
+      const res = await connectSaveFolder();
+      if (!res.ok && res.message && res.message !== '폴더 선택이 취소되었습니다.') {
+        setErrorMsg(res.message);
+      }
+    } catch (err) {
+      console.error(err);
+      setErrorMsg('폴더를 연결하는 중 예기치 못한 오류가 발생했습니다.');
+    } finally {
+      setConnecting(false);
     }
+  };
+
+  const handleRegisterFiles = async (fileList: FileList | null) => {
+    if (!fileList || fileList.length === 0) return;
+    setRegistering(true);
+    setErrorMsg(null);
+    const res = await addFilesToProjectMedia(Array.from(fileList));
+    setRegistering(false);
+    if (!res.ok) {
+      setErrorMsg(res.message ?? '파일을 등록하는 중 문제가 발생했습니다.');
+      return;
+    }
+    reloadItems();
+    if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
   const handleApply = async (entry: MediaFileEntry) => {
@@ -3650,6 +4401,15 @@ function MediaLibraryModal({ darkMode, onClose }: { darkMode: boolean; onClose: 
       <div className={cn('w-full max-w-3xl max-h-[85vh] flex flex-col rounded-2xl border shadow-2xl', modalBg)}>
         <div className={cn('flex items-center justify-between px-6 py-4 border-b shrink-0', darkMode ? 'border-neutral-800' : 'border-neutral-200')}>
           <div className="flex items-center gap-2">
+            {onBack && (
+              <button
+                onClick={onBack}
+                title="가져오기 목록으로"
+                className={cn('w-7 h-7 -ml-1 flex items-center justify-center rounded-lg shrink-0', darkMode ? 'hover:bg-neutral-800' : 'hover:bg-neutral-100')}
+              >
+                <ArrowLeft className="w-4 h-4" />
+              </button>
+            )}
             <ImageIcon className="w-5 h-5 text-emerald-500" />
             <h2 className="font-bold text-base">미디어 라이브러리</h2>
           </div>
@@ -3685,10 +4445,23 @@ function MediaLibraryModal({ darkMode, onClose }: { darkMode: boolean; onClose: 
             {multiSelect ? '여러 개 선택 중' : '여러 개 선택해서 AI로 만들기'}
           </button>
           <div className="flex-1" />
-          {mediaDirHandle ? (
-            <span className="flex items-center gap-1.5 text-emerald-500">
-              <FolderCheck className="w-3.5 h-3.5" /> "{mediaDirName}" 연결됨
-            </span>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*,video/*"
+            multiple
+            className="hidden"
+            onChange={(e) => handleRegisterFiles(e.target.files)}
+          />
+          {hasRealFolder ? (
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              disabled={registering}
+              className="flex items-center gap-1.5 font-medium px-2.5 py-1 rounded-md text-emerald-600 hover:bg-emerald-50 dark:text-emerald-400 dark:hover:bg-emerald-500/10 transition-colors"
+            >
+              {registering ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <FolderPlus className="w-3.5 h-3.5" />}
+              사진/영상 등록
+            </button>
           ) : (
             <button
               onClick={handleConnect}
@@ -3696,32 +4469,51 @@ function MediaLibraryModal({ darkMode, onClose }: { darkMode: boolean; onClose: 
               className="flex items-center gap-1.5 font-medium px-2.5 py-1 rounded-md text-emerald-600 hover:bg-emerald-50 dark:text-emerald-400 dark:hover:bg-emerald-500/10 transition-colors"
             >
               {connecting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Link2 className="w-3.5 h-3.5" />}
-              미디어 폴더 연결
+              저장 폴더 연결
             </button>
           )}
         </div>
 
         <div className="flex-1 overflow-y-auto scrollbar-hide p-6">
-          {!mediaDirHandle ? (
+          {!hasRealFolder ? (
             <div className="flex flex-col items-center justify-center gap-3 py-16 text-center">
               <ImageIcon className={cn('w-12 h-12', darkMode ? 'text-neutral-700' : 'text-neutral-300')} />
               <p className={cn('text-sm', darkMode ? 'text-neutral-400' : 'text-neutral-500')}>
-                이미지·영상이 들어있는 내 컴퓨터 폴더를 연결하면
+                실제 저장 폴더를 등록하면 사진/영상을 등록하고
                 <br />
                 여기서 바로 골라 장면에 적용할 수 있습니다.
               </p>
               <p className={cn('text-xs max-w-sm', darkMode ? 'text-neutral-600' : 'text-neutral-400')}>
-                원본 파일은 저장 폴더로 복사되지 않고, 파일명만 기억해두었다가 같은 미디어 폴더를 다시 연결하면 자동으로 복원됩니다.
+                등록한 사진/영상은 브라우저가 아닌, 사용자가 고른 저장 폴더 안에 실제 파일로 저장됩니다.
               </p>
+              <button
+                onClick={handleConnect}
+                disabled={connecting}
+                className="mt-1 flex items-center gap-1.5 font-medium px-3 py-1.5 rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 transition-colors"
+              >
+                {connecting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Link2 className="w-3.5 h-3.5" />}
+                저장 폴더 연결하기
+              </button>
             </div>
           ) : loading ? (
             <div className="flex items-center justify-center gap-2 py-16 text-sm text-neutral-400">
               <Loader2 className="w-4 h-4 animate-spin" /> 미디어를 불러오는 중...
             </div>
           ) : items.length === 0 ? (
-            <p className={cn('text-sm text-center py-16', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>
-              이 폴더에서 이미지/영상 파일을 찾지 못했습니다.
-            </p>
+            <div className="flex flex-col items-center justify-center gap-3 py-16 text-center">
+              <ImageOff className={cn('w-10 h-10', darkMode ? 'text-neutral-700' : 'text-neutral-300')} />
+              <p className={cn('text-sm', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>
+                아직 등록된 사진/영상이 없습니다.
+              </p>
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                disabled={registering}
+                className="flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 transition-colors"
+              >
+                {registering ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <FolderPlus className="w-3.5 h-3.5" />}
+                사진/영상 등록하기
+              </button>
+            </div>
           ) : (
             <>
               <div className="flex items-center gap-1.5 mb-4">

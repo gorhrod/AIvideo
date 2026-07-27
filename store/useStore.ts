@@ -12,17 +12,39 @@ import {
   readTextFileIfExists,
   listJsonFiles,
   readJsonFile,
-  findMediaFileByName,
+  listMediaFiles,
   fileHandleToObjectUrl,
   getOpfsRoot,
   rememberDirectoryHandle,
   getRememberedDirectoryHandle,
   forgetRememberedDirectoryHandle,
   queryPermissionSilently,
+  getProjectMediaDir,
+  getProjectDir,
+  writeBinaryFile,
+  buildUniqueMediaFileName,
   REMEMBERED_SAVE_DIR_KEY,
+  MEDIA_ANALYSIS_FILE_NAME,
   type MediaFileEntry,
 } from '@/lib/fsAccess';
 import { readBlogData, type BlogPost, type BlogMediaMeta, type BlogCategory } from '@/lib/blogData';
+
+// 2026-07-27(3): 폴더 선택/연결 도중 나는 오류가 화면에서 "영원히 로딩 중"으로만 보이던 문제를
+// 고치기 위한 공용 헬퍼입니다. pickDirectory/verifyPermission 등은 사용자가 다이얼로그를
+// 취소한 경우 외에도(예: 브라우저가 사용자 제스처로 인식하지 못해 막는 SecurityError 등)
+// 예외를 던질 수 있는데, 이걸 호출부에서 못 잡으면 busy 상태가 절대 풀리지 않습니다.
+// 아래 헬퍼로 어떤 예외든 사람이 이해할 수 있는 한국어 문구로 바꿔 반환합니다.
+function describeFolderPickError(err: unknown): string {
+  const name = (err as any)?.name;
+  const message = (err as any)?.message;
+  if (name === 'SecurityError') {
+    return '브라우저가 폴더 선택창을 열지 못했습니다. 페이지를 새로고침한 뒤 버튼을 다시 눌러주세요.';
+  }
+  if (name === 'NotFoundError') {
+    return '선택한 폴더를 찾을 수 없습니다. 폴더가 이동되었거나 삭제되지 않았는지 확인해주세요.';
+  }
+  return `폴더를 여는 중 문제가 발생했습니다.${message ? ` (${message})` : ''}`;
+}
 
 export interface Scene {
   id: string;
@@ -42,6 +64,25 @@ export interface Scene {
   /** 블로그 데이터에서 가져온 장면이면 원본 글/미디어 id (추적용, 선택 항목) */
   sourcePostId?: string;
   sourceMediaId?: string;
+  /** 2026-07-27(4) 추가: "비슷한 이미지 추천" 패널에서 이 장면 전용으로 등록한 프로젝트
+   *  미디어 파일 경로들(KWJMvideoAI_data/projects/<프로젝트명>/media/ 기준). 다른 장면의
+   *  추천 패널에는 나타나지 않고, 오직 이 장면에서만 "등록된 미디어"로 표시됩니다. */
+  pinnedMediaPaths?: string[];
+}
+
+/** 프로젝트 media 폴더 안 파일 하나에 대한 AI(휴리스틱) 분석 결과 — 비슷한 이미지 추천에 사용됩니다.
+ *  현재 연결 가능한 LM Studio 모델은 텍스트 전용이라(agent.md 10절 참고) 실제 이미지 인식은
+ *  하지 못하므로, 파일명에서 뽑아낸 태그/설명을 "메타데이터 기반 분석"으로 사용합니다. */
+export interface MediaAnalysisEntry {
+  /** listProjectMediaFiles()가 반환하는 MediaFileEntry.path와 동일한 값(파일명) */
+  path: string;
+  kind: 'image' | 'video';
+  /** 파일 변경 감지용 (재분석이 필요한지 판단) */
+  size: number;
+  lastModified: number;
+  tags: string[];
+  caption: string;
+  analyzedAt: string;
 }
 
 export interface Project {
@@ -55,7 +96,7 @@ export interface Project {
 }
 
 export type ViewState = 'chat' | 'editor';
-export type ModalState = null | 'new-project' | 'load' | 'export' | 'media' | 'settings' | 'blog-import';
+export type ModalState = null | 'new-project' | 'load' | 'export' | 'media' | 'settings' | 'blog-import' | 'import';
 
 export type LlmStatus = 'unknown' | 'checking' | 'online' | 'offline';
 /** 빠른모드: 속도 위주(짧은 생성, 응답이 가장 빠름) · 보통모드: 가성비(기본값) · 전문가모드: 토큰을 많이 써서 더 길고 자세한 결과 */
@@ -94,16 +135,43 @@ const README_CONTENT = `KWJMvideoAI 저장 폴더
 - chat_history.json: 채팅 화면의 대화 기록
 - edit_log.json    : 장면 추가/삭제/수정, 이미지 교체 등 수정 이력
 - projects/        : "새 프로젝트"로 이름을 붙여 저장한 프로젝트들(JSON)
+- projects/<프로젝트명>/media/ : 스토리보드 편집기에서 "사진 등록"/"영상 등록" 버튼으로
+  직접 등록한 사진·영상 원본 파일이 실제로 복사되어 저장되는 곳입니다. 프로젝트별로
+  폴더가 나뉘어 있어 탐색기에서 바로 열어 확인할 수 있습니다.
 
-이미지·영상 원본 파일은 이 폴더에 복사되지 않습니다. 앱에서 별도로
-연결한 "미디어 폴더"에 있는 파일을 그대로 참조(파일명 기억)하며,
-같은 미디어 폴더를 다시 연결하면 자동으로 미리보기가 복원됩니다.
+별도로 "미디어 폴더"를 연결해 사용하는 사진/영상은 이 폴더에 복사되지 않고, 원본
+위치의 파일을 그대로 참조(파일명 기억)합니다 — 같은 미디어 폴더를 다시 연결하면
+자동으로 미리보기가 복원됩니다.
 
-이 폴더를 지우거나 옮기면 저장된 기록도 함께 사라지니 주의하세요.
+이 폴더를 지우거나 옮기면 저장된 기록(등록한 사진·영상 포함)도 함께 사라지니 주의하세요.
 `;
 
 function genId(prefix: string): string {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/**
+ * 파일명에서 태그/설명을 뽑아내는 휴리스틱 분석입니다 (2026-07-27(4) 추가).
+ *
+ * agent.md 10절에 명시된 대로, 현재 연결 가능한 LM Studio 모델은 텍스트 전용이라 사진을
+ * 직접 "보고" 분석하지 못합니다. 그래서 실제 이미지 인식 대신, 등록 시 붙는 타임스탬프/
+ * 임의문자 접두어(`buildUniqueMediaFileName` 참고)를 제거한 원래 파일명을 토큰으로 쪼개
+ * 태그처럼 사용합니다 — 사용자가 "제주_협재_노을.jpg"처럼 의미 있는 이름으로 등록해두면
+ * 그만큼 추천 정확도가 올라갑니다. 나중에 비전(Vision) 모델을 연결하면 이 함수를 실제
+ * 이미지 인식 호출로 교체하되, 반환 형태(tags/caption)는 그대로 유지하면 됩니다.
+ */
+function analyzeMediaFileName(fileName: string, kind: 'image' | 'video'): { tags: string[]; caption: string } {
+  const dot = fileName.lastIndexOf('.');
+  const base = dot > 0 ? fileName.slice(0, dot) : fileName;
+  // buildUniqueMediaFileName이 붙이는 `<timestamp>_<random4자>_` 접두어를 제거합니다.
+  const withoutPrefix = base.replace(/^\d{6,}_[a-z0-9]{2,8}_/i, '');
+  const tokens = withoutPrefix
+    .split(/[_\-.\s]+/)
+    .map((t) => t.trim())
+    .filter((t) => t.length >= 2 && !/^\d+$/.test(t));
+  const uniqueTags = Array.from(new Set(tokens.map((t) => t.toLowerCase()))).slice(0, 8);
+  const caption = uniqueTags.length > 0 ? uniqueTags.join(' ') : kind === 'video' ? '영상' : '사진';
+  return { tags: uniqueTags, caption };
 }
 
 /** 저장용으로 씬을 정리합니다: 세션에만 유효한 blob URL은 제거하고, 로컬 파일명 참조만 남깁니다. */
@@ -121,85 +189,8 @@ export function sanitizeScenesForSave(scenes: Scene[]): Scene[] {
   return scenes.map(sanitizeSceneForSave);
 }
 
-const SAMPLE_SCENES: Scene[] = [
-  {
-    id: 'scene_001',
-    customTitle: '제주 바다 도착',
-    photoRef: 'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=800&h=450&fit=crop&auto=format',
-    narration: '2023년 여름, 우리 가족은 에메랄드빛 바다가 매력적인 제주도로 첫발을 내디뎠다. 눈부신 햇살 아래 펼쳐진 수평선이 우리를 반겼다.',
-    dialogue: '와, 바다다! 너무 예뻐요! 어서 가요!',
-    duration: 5,
-    tags: ['해변', '바다', '제주'],
-  },
-  {
-    id: 'scene_002',
-    customTitle: '해변 산책',
-    photoRef: 'https://images.unsplash.com/photo-1473496169904-658ba7c44d8a?w=800&h=450&fit=crop&auto=format',
-    narration: '고운 모래사장을 맨발로 걸으며 아이들은 조개껍질을 줍고, 어른들은 시원한 파도 소리에 피로를 씻었다.',
-    dialogue: '아빠, 이것 봐! 소라 껍데기야. 가져가도 돼요?',
-    duration: 4,
-    tags: ['해변', '산책', '가족'],
-  },
-  {
-    id: 'scene_003',
-    customTitle: '오름 하이킹',
-    photoRef: 'https://images.unsplash.com/photo-1426604966848-d7adac402bff?w=800&h=450&fit=crop&auto=format',
-    narration: '이튿날 아침, 우리는 성산일출봉 근처 오름에 올랐다. 초록빛 능선이 발아래 펼쳐지며 제주의 진짜 얼굴을 보여줬다.',
-    dialogue: '여기서 보면 제주가 전부 보이네. 정말 아름답다.',
-    duration: 6,
-    tags: ['오름', '자연', '하이킹'],
-  },
-  {
-    id: 'scene_004',
-    customTitle: '감성 카페 방문',
-    photoRef: 'https://images.unsplash.com/photo-1501339847302-ac426a4a7cbb?w=800&h=450&fit=crop&auto=format',
-    narration: '하산 후 들른 감성 카페에서 제주산 감귤 에이드 한 잔. 지친 다리를 쉬어가며 창밖 풍경에 취했다.',
-    dialogue: '이 에이드 진짜 맛있다. 제주 오길 잘했어.',
-    duration: 4,
-    tags: ['카페', '휴식', '음료'],
-  },
-  {
-    id: 'scene_005',
-    customTitle: '노을빛 마무리',
-    photoRef: 'https://images.unsplash.com/photo-1542315149-c146eb4a0fc0?w=800&h=450&fit=crop&auto=format',
-    narration: '저녁 무렵 바닷가에서 마주한 붉은 노을. 짧았지만 가슴 가득 채워진 제주의 시간이 하루를 아름답게 닫았다.',
-    dialogue: '오늘 정말 행복했지? 내년에 또 오자.',
-    duration: 7,
-    tags: ['노을', '석양', '감성'],
-  },
-];
-
-const SAMPLE_PROJECT: Project = {
-  id: 'proj_sample',
-  name: '제주 가족 여행 브이로그 (샘플)',
-  folderPath: '샘플 데이터 — 실제 파일 아님',
-  createdAt: '2023-08-15T09:00:00Z',
-  modifiedAt: '2023-08-20T14:30:00Z',
-  scenes: SAMPLE_SCENES,
-  thumbnail: 'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=400&h=225&fit=crop&auto=format',
-};
-
-const SAMPLE_PROJECTS: Project[] = [
-  SAMPLE_PROJECT,
-  {
-    id: 'proj_002',
-    name: '서울 일상 브이로그 (샘플)',
-    folderPath: '샘플 데이터 — 실제 파일 아님',
-    createdAt: '2023-09-01T10:00:00Z',
-    modifiedAt: '2023-09-05T16:00:00Z',
-    scenes: SAMPLE_SCENES.slice(0, 3),
-    thumbnail: 'https://images.unsplash.com/photo-1601621915196-2621bfb0cd6e?w=400&h=225&fit=crop&auto=format',
-  },
-  {
-    id: 'proj_003',
-    name: '부산 바다 여행 (샘플)',
-    folderPath: '샘플 데이터 — 실제 파일 아님',
-    createdAt: '2023-10-10T08:00:00Z',
-    modifiedAt: '2023-10-12T20:00:00Z',
-    scenes: SAMPLE_SCENES.slice(0, 2),
-    thumbnail: 'https://images.unsplash.com/photo-1594736797933-d0401ba2fe65?w=400&h=225&fit=crop&auto=format',
-  },
-];
+// 2026-07-27(3): 이 프로젝트는 이제 샘플/데모 데이터를 전혀 사용하지 않습니다. 모든 프로젝트,
+// 장면, 미디어는 사용자가 연결한 실제 저장 폴더의 실제 파일에서만 만들어집니다.
 
 const INITIAL_CHAT_MESSAGE: ChatMessage = {
   id: genId('msg'),
@@ -224,16 +215,23 @@ interface AppState {
   moveScene: (id: string, direction: 'up' | 'down') => void;
   deleteScene: (id: string) => void;
   addScene: () => void;
-  applyImageToScene: (id: string, photoRef: string, opts?: { localImageName?: string | null; logMessage?: string }) => void;
+  applyImageToScene: (
+    id: string,
+    photoRef: string,
+    opts?: { localImageName?: string | null; logMessage?: string; sourcePostId?: string | null; sourceMediaId?: string | null }
+  ) => void;
   applyLocalVideoToScene: (id: string, fileEntry: MediaFileEntry) => Promise<void>;
+  /** 사용자가 컴퓨터에서 직접 고른 사진 파일을 장면에 등록하고, 저장 폴더 안 프로젝트별
+   *  media 폴더(KWJMvideoAI_data/projects/<프로젝트명>/media/)에 실제로 복사해 저장합니다. */
+  uploadPhotoToScene: (id: string, file: File) => Promise<{ ok: boolean; message?: string }>;
+  /** uploadPhotoToScene과 동일하지만 영상 파일용입니다. */
+  uploadVideoToScene: (id: string, file: File) => Promise<{ ok: boolean; message?: string }>;
 
   selectedSceneId: string | null;
   setSelectedSceneId: (id: string | null) => void;
 
   currentProject: Project | null;
   setCurrentProject: (project: Project | null) => void;
-  savedProjects: Project[];
-  setSavedProjects: (projects: Project[]) => void;
 
   chatMessages: ChatMessage[];
   addChatMessage: (role: 'user' | 'assistant', text: string) => void;
@@ -269,12 +267,27 @@ interface AppState {
   saveNamedProject: (name: string) => Promise<{ ok: boolean; message?: string }>;
   listNamedProjects: () => Promise<{ name: string; handle: any; modifiedAt?: string; sceneCount?: number }[]>;
   loadNamedProject: (fileHandle: any) => Promise<{ ok: boolean; message?: string }>;
+  /** 저장 폴더의 projects/<이름>.json 파일 하나를 삭제합니다 ("불러오기" 목록의 삭제 버튼용). */
+  deleteNamedProject: (fileName: string) => Promise<{ ok: boolean; message?: string }>;
 
-  mediaDirHandle: any | null;
-  mediaDirName: string | null;
-  connectMediaFolder: () => Promise<{ ok: boolean; message?: string }>;
-  disconnectMediaFolder: () => void;
+  // 2026-07-27(2): 이전에는 "미디어 폴더 연결"(mediaDirHandle)로 사용자가 이미 갖고 있는
+  // 폴더를 읽기 전용으로 별도 참조했지만, 브라우저 저장소가 커지고 개념이 두 갈래로
+  // 나뉘는 문제가 있어 완전히 제거하고 저장 폴더(자동 저장소 포함)에 합쳤습니다. 사진/영상은
+  // 항상 현재 프로젝트의 KWJMvideoAI_data/projects/<프로젝트명>/media/ 폴더에 실제로
+  // 저장되고, 미디어 라이브러리도 그 폴더를 그대로 보여줍니다.
+  /** 현재 프로젝트의 media 폴더에 이미 저장되어 있는 사진/영상 목록을 반환합니다. */
+  listProjectMediaFiles: () => Promise<MediaFileEntry[]>;
+  /** 사용자가 고른 파일들을 현재 프로젝트의 media 폴더에 실제로 복사해 라이브러리에 추가합니다. */
+  addFilesToProjectMedia: (files: File[]) => Promise<{ ok: boolean; message?: string; added?: MediaFileEntry[] }>;
   resyncMediaReferences: () => Promise<void>;
+
+  // 2026-07-27(4): "비슷한 이미지 추천"이 매번 처음부터 다시 분석하지 않도록, 프로젝트별
+  // 분석 결과를 메모리에도 캐시해두고 저장 폴더 안 media_analysis.json에도 저장합니다.
+  mediaAnalysisCache: Record<string, MediaAnalysisEntry[]>;
+  /** 현재 프로젝트 media 폴더의 파일별 분석 데이터를 반환합니다. 저장 폴더에 이미
+   *  media_analysis.json이 있고 파일이 바뀌지 않았으면 그 데이터를 그대로 재사용하고,
+   *  새 파일이거나 캐시가 없으면 새로 분석해 저장 폴더에 다시 저장합니다. */
+  ensureProjectMediaAnalysis: () => Promise<MediaAnalysisEntry[]>;
 
   // ── 블로그 데이터 폴더 (posts.json / media-meta.json / uploads) ──────────
   blogDirHandle: any | null;
@@ -379,6 +392,12 @@ export const useStore = create<AppState>((set, get) => {
             },
           }));
         }
+        // 2026-07-27: 저장 시 blob: URL은 지워지고 localImageName/localVideoName(파일명)만
+        // 남으므로, 폴더를 다시 연결한 직후 프로젝트 media 폴더(및 연결된 미디어 폴더)에서
+        // 실제 파일을 찾아 미리보기를 복원합니다.
+        get()
+          .resyncMediaReferences()
+          .catch((err) => console.error(err));
       }
       if (chatData && Array.isArray(chatData.messages) && chatData.messages.length > 0) {
         set({ chatMessages: chatData.messages });
@@ -414,8 +433,9 @@ export const useStore = create<AppState>((set, get) => {
 
   return {
     // 2026-07-25: 처음 실행하거나(yarn start) 새 프로젝트를 만들었을 때 항상 빈 스토리보드에서
-    // 시작하도록, 초기 view는 채팅 화면(view: 'chat')으로 둡니다. 샘플 씬(SAMPLE_SCENES)은
-    // 더 이상 기본값으로 쓰지 않고, "불러오기" 모달의 "샘플 프로젝트" 섹션에서만 사용합니다.
+    // 시작하도록, 초기 view는 채팅 화면(view: 'chat')으로 둡니다. 2026-07-27(3)부터는 샘플/데모
+    // 데이터를 코드에서 완전히 제거해, 모든 프로젝트/장면/미디어는 사용자의 실제 저장 폴더에서만
+    // 만들어집니다.
     view: 'chat',
     setView: (view) => set({ view }),
     modal: null,
@@ -475,7 +495,15 @@ export const useStore = create<AppState>((set, get) => {
     applyImageToScene: (id, photoRef, opts) => {
       set((s) => ({
         scenes: s.scenes.map((sc) =>
-          sc.id === id ? { ...sc, photoRef, localImageName: opts?.localImageName ?? undefined } : sc
+          sc.id === id
+            ? {
+                ...sc,
+                photoRef,
+                localImageName: opts?.localImageName ?? undefined,
+                ...(opts && 'sourcePostId' in opts ? { sourcePostId: opts.sourcePostId ?? undefined } : {}),
+                ...(opts && 'sourceMediaId' in opts ? { sourceMediaId: opts.sourceMediaId ?? undefined } : {}),
+              }
+            : sc
         ),
       }));
       addLogEntry('image_apply', opts?.logMessage ?? '장면 이미지 교체');
@@ -492,13 +520,72 @@ export const useStore = create<AppState>((set, get) => {
       scheduleAutosave();
     },
 
+    // ── 2026-07-27(2) 수정: 스토리보드 편집기에서 사진/영상 직접 등록 ──────────────
+    //
+    // 사진/영상은 항상 저장 폴더 안 프로젝트별 media 폴더에 실제 파일로 저장됩니다
+    // (별도 "미디어 폴더"는 더 이상 존재하지 않습니다 — 완전히 저장 폴더에 합쳐졌습니다).
+    // 브라우저 내부 자동 저장소(OPFS)만으로는 사용자가 탐색기에서 파일을 확인할 수 없고,
+    // 브라우저 저장 용량이 계속 커지는 문제가 있으므로, 이 기능은 사용자가 "저장 폴더
+    // 연결"로 실제 폴더를 등록했을 때만 사용할 수 있습니다. 아직 등록 전이면 먼저
+    // 등록하라고 안내합니다.
+    uploadPhotoToScene: async (id, file) => {
+      const state = get();
+      if (!state.saveDirHandle || state.saveDirSource !== 'external') {
+        return { ok: false, message: '실제 저장 폴더를 먼저 등록해야 사진을 등록할 수 있습니다. 상단의 "저장 폴더 연결"을 눌러주세요.' };
+      }
+      try {
+        const granted = await verifyPermission(state.saveDirHandle, 'readwrite');
+        if (!granted) return { ok: false, message: '폴더 쓰기 권한이 없습니다.' };
+        const dataDir = await getDataDir(state.saveDirHandle);
+        const projectName = state.currentProject?.name || '임시_프로젝트';
+        const mediaDir = await getProjectMediaDir(dataDir, projectName);
+        const fileName = buildUniqueMediaFileName(file.name);
+        await writeBinaryFile(mediaDir, fileName, file);
+        const url = URL.createObjectURL(file);
+        set((s) => ({
+          scenes: s.scenes.map((sc) => (sc.id === id ? { ...sc, photoRef: url, localImageName: fileName } : sc)),
+        }));
+        addLogEntry('image_apply', `장면에 사진 등록(파일 업로드): ${fileName} → "${projectName}" 프로젝트 미디어 폴더에 저장됨`);
+        scheduleAutosave();
+        return { ok: true, message: `사진이 "${projectName}" 프로젝트 폴더 안 media 폴더에 저장되었습니다.` };
+      } catch (err) {
+        console.error(err);
+        return { ok: false, message: '사진을 저장하는 중 문제가 발생했습니다.' };
+      }
+    },
+    uploadVideoToScene: async (id, file) => {
+      const state = get();
+      if (!state.saveDirHandle || state.saveDirSource !== 'external') {
+        return { ok: false, message: '실제 저장 폴더를 먼저 등록해야 영상을 등록할 수 있습니다. 상단의 "저장 폴더 연결"을 눌러주세요.' };
+      }
+      try {
+        const granted = await verifyPermission(state.saveDirHandle, 'readwrite');
+        if (!granted) return { ok: false, message: '폴더 쓰기 권한이 없습니다.' };
+        const dataDir = await getDataDir(state.saveDirHandle);
+        const projectName = state.currentProject?.name || '임시_프로젝트';
+        const mediaDir = await getProjectMediaDir(dataDir, projectName);
+        const fileName = buildUniqueMediaFileName(file.name);
+        await writeBinaryFile(mediaDir, fileName, file);
+        const url = URL.createObjectURL(file);
+        set((s) => ({
+          scenes: s.scenes.map((sc) =>
+            sc.id === id ? { ...sc, localVideoName: fileName, localVideoUrl: url } : sc
+          ),
+        }));
+        addLogEntry('video_apply', `장면에 영상 등록(파일 업로드): ${fileName} → "${projectName}" 프로젝트 미디어 폴더에 저장됨`);
+        scheduleAutosave();
+        return { ok: true, message: `영상이 "${projectName}" 프로젝트 폴더 안 media 폴더에 저장되었습니다.` };
+      } catch (err) {
+        console.error(err);
+        return { ok: false, message: '영상을 저장하는 중 문제가 발생했습니다.' };
+      }
+    },
+
     selectedSceneId: null,
     setSelectedSceneId: (id) => set({ selectedSceneId: id }),
 
     currentProject: null,
     setCurrentProject: (project) => set({ currentProject: project, scenes: project?.scenes ?? [] }),
-    savedProjects: SAMPLE_PROJECTS,
-    setSavedProjects: (projects) => set({ savedProjects: projects }),
 
     resetForNewProject: () => {
       set({
@@ -567,29 +654,43 @@ export const useStore = create<AppState>((set, get) => {
     },
 
     reconnectRememberedSaveFolder: async () => {
-      const remembered = await getRememberedDirectoryHandle(REMEMBERED_SAVE_DIR_KEY);
-      if (!remembered) return { ok: false, message: '기억된 저장 폴더가 없습니다.' };
-      const granted = await verifyPermission(remembered, 'readwrite');
-      if (!granted) return { ok: false, message: '폴더 쓰기 권한이 거부되었습니다.' };
-      return attachSaveDir(remembered, 'external', remembered.name ?? '저장 폴더');
+      try {
+        const remembered = await getRememberedDirectoryHandle(REMEMBERED_SAVE_DIR_KEY);
+        if (!remembered) return { ok: false, message: '기억된 저장 폴더가 없습니다.' };
+        const granted = await verifyPermission(remembered, 'readwrite');
+        if (!granted) return { ok: false, message: '폴더 쓰기 권한이 거부되었습니다.' };
+        return await attachSaveDir(remembered, 'external', remembered.name ?? '저장 폴더');
+      } catch (err) {
+        console.error(err);
+        return { ok: false, message: describeFolderPickError(err) };
+      }
     },
 
     connectSaveFolder: async () => {
-      const handle = await pickDirectory('readwrite');
-      if (!handle) return { ok: false, message: '폴더 선택이 취소되었습니다.' };
+      try {
+        const handle = await pickDirectory('readwrite');
+        if (!handle) return { ok: false, message: '폴더 선택이 취소되었습니다.' };
 
-      const granted = await verifyPermission(handle, 'readwrite');
-      if (!granted) {
-        return { ok: false, message: '폴더 쓰기 권한이 거부되었습니다.' };
-      }
+        const granted = await verifyPermission(handle, 'readwrite');
+        if (!granted) {
+          return { ok: false, message: '폴더 쓰기 권한이 거부되었습니다.' };
+        }
 
-      const res = await attachSaveDir(handle, 'external', handle.name);
-      if (res.ok) {
-        // 다음 방문 때 "마지막에 저장한 폴더"로 자동 재연결을 시도할 수 있도록 기억해둡니다.
-        rememberDirectoryHandle(REMEMBERED_SAVE_DIR_KEY, handle).catch((err) => console.error(err));
-        set({ rememberedSaveDirName: handle.name });
+        const res = await attachSaveDir(handle, 'external', handle.name);
+        if (res.ok) {
+          // 다음 방문 때 "마지막에 저장한 폴더"로 자동 재연결을 시도할 수 있도록 기억해둡니다.
+          rememberDirectoryHandle(REMEMBERED_SAVE_DIR_KEY, handle).catch((err) => console.error(err));
+          set({ rememberedSaveDirName: handle.name });
+        }
+        return res;
+      } catch (err) {
+        // 2026-07-27(3): 이 catch가 없으면(예: 브라우저가 폴더 선택창을 사용자 제스처로
+        // 인식하지 못해 SecurityError를 던지는 경우) 이 함수 전체가 예외를 던지고, 이를
+        // 호출하는 모든 화면의 "연결 중..." 스피너가 영원히 멈추지 않는 문제가 있었습니다.
+        // 이제 어떤 예외가 나도 항상 { ok:false, message } 형태로 반환합니다.
+        console.error(err);
+        return { ok: false, message: describeFolderPickError(err) };
       }
-      return res;
     },
 
     disconnectSaveFolder: () => {
@@ -630,7 +731,6 @@ export const useStore = create<AppState>((set, get) => {
                 modifiedAt: now,
               }
             : null,
-          mediaDirName: state.mediaDirName,
           llmBaseUrl: state.llmBaseUrl,
           llmModel: state.llmModel,
           llmMode: state.llmMode,
@@ -744,46 +844,111 @@ export const useStore = create<AppState>((set, get) => {
       }
     },
 
-    mediaDirHandle: null,
-    mediaDirName: null,
-    connectMediaFolder: async () => {
-      const handle = await pickDirectory('read');
-      if (!handle) return { ok: false, message: '폴더 선택이 취소되었습니다.' };
-      const granted = await verifyPermission(handle, 'read');
-      if (!granted) return { ok: false, message: '폴더 읽기 권한이 거부되었습니다.' };
-      set({ mediaDirHandle: handle, mediaDirName: handle.name });
-      addLogEntry('media_connect', `미디어 폴더 연결됨: "${handle.name}"`);
-      await get().resyncMediaReferences();
-      scheduleAutosave();
-      return { ok: true, message: `"${handle.name}" 폴더에 연결되었습니다.` };
+    deleteNamedProject: async (fileName) => {
+      const state = get();
+      if (!state.saveDirHandle) {
+        return { ok: false, message: '저장 폴더가 연결되지 않았습니다.' };
+      }
+      try {
+        const granted = await verifyPermission(state.saveDirHandle, 'readwrite');
+        if (!granted) return { ok: false, message: '폴더 쓰기 권한이 없습니다.' };
+        const dataDir = await getDataDir(state.saveDirHandle);
+        const projectsDir = await getProjectsDir(dataDir);
+        await projectsDir.removeEntry(fileName);
+        addLogEntry('project_delete', `프로젝트 파일 삭제: "${fileName}"`);
+        return { ok: true, message: '프로젝트가 삭제되었습니다.' };
+      } catch (err) {
+        console.error(err);
+        return { ok: false, message: '프로젝트를 삭제하는 중 문제가 발생했습니다.' };
+      }
     },
-    disconnectMediaFolder: () => {
-      set({ mediaDirHandle: null, mediaDirName: null });
+
+    // 2026-07-27(2): 이전 "미디어 폴더 연결"(mediaDirHandle) 개념을 완전히 제거하고 저장
+    // 폴더(자동 저장소 포함)와 하나로 합쳤습니다. 새 사진/영상을 등록하는 것도, 이미 등록된
+    // 미디어를 살펴보는 것도 모두 현재 프로젝트의 KWJMvideoAI_data/projects/<프로젝트명>/media/
+    // 폴더 하나만 사용합니다. 이 기능은 실제 폴더가 연결되어 있어야만(OPFS 자동 저장소만으로는
+    // 부족) 동작합니다 — 사용자가 먼저 저장 폴더를 등록하도록 안내합니다.
+    listProjectMediaFiles: async () => {
+      const state = get();
+      if (!state.saveDirHandle || state.saveDirSource !== 'external') return [];
+      try {
+        const dataDir = await getDataDir(state.saveDirHandle);
+        const projectName = state.currentProject?.name || '임시_프로젝트';
+        const mediaDir = await getProjectMediaDir(dataDir, projectName);
+        return await listMediaFiles(mediaDir, 1);
+      } catch (err) {
+        console.error(err);
+        return [];
+      }
+    },
+    addFilesToProjectMedia: async (files) => {
+      const state = get();
+      if (!state.saveDirHandle || state.saveDirSource !== 'external') {
+        return { ok: false, message: '실제 저장 폴더를 먼저 등록해야 사진/영상을 등록할 수 있습니다. 저장 폴더를 연결해주세요.' };
+      }
+      try {
+        const granted = await verifyPermission(state.saveDirHandle, 'readwrite');
+        if (!granted) return { ok: false, message: '폴더 쓰기 권한이 없습니다.' };
+        const dataDir = await getDataDir(state.saveDirHandle);
+        const projectName = state.currentProject?.name || '임시_프로젝트';
+        const mediaDir = await getProjectMediaDir(dataDir, projectName);
+        const added: MediaFileEntry[] = [];
+        for (const file of files) {
+          const fileName = buildUniqueMediaFileName(file.name);
+          await writeBinaryFile(mediaDir, fileName, file);
+          const lower = fileName.toLowerCase();
+          const kind: 'image' | 'video' = /\.(mp4|mov|webm|mkv|avi|m4v)$/.test(lower) ? 'video' : 'image';
+          const handle = await mediaDir.getFileHandle(fileName, { create: false });
+          added.push({ name: fileName, path: fileName, handle, kind });
+        }
+        addLogEntry('media_upload', `미디어 라이브러리에 파일 ${added.length}개 등록됨 → "${projectName}" 프로젝트 media 폴더`);
+        scheduleAutosave();
+        return { ok: true, message: `${added.length}개 파일이 저장되었습니다.`, added };
+      } catch (err) {
+        console.error(err);
+        return { ok: false, message: '파일을 저장하는 중 문제가 발생했습니다.' };
+      }
     },
     resyncMediaReferences: async () => {
       const state = get();
-      if (!state.mediaDirHandle) return;
+      const needsResync = state.scenes.some((sc) => sc.localImageName || (sc.localVideoName && !sc.localVideoUrl));
+      if (!needsResync || !state.saveDirHandle) return;
+
+      let projectMediaDir: any = null;
+      try {
+        const dataDir = await getDataDir(state.saveDirHandle);
+        const projectName = state.currentProject?.name || '임시_프로젝트';
+        projectMediaDir = await getProjectMediaDir(dataDir, projectName);
+      } catch (err) {
+        console.error(err);
+      }
+
+      const resolveFile = async (name: string): Promise<any | null> => {
+        if (projectMediaDir) {
+          try {
+            return await projectMediaDir.getFileHandle(name, { create: false });
+          } catch {
+            // 프로젝트 미디어 폴더에도 없으면 조용히 무시
+          }
+        }
+        return null;
+      };
+
       const updated = await Promise.all(
         state.scenes.map(async (sc) => {
           let next = sc;
           if (sc.localImageName) {
             try {
-              const fh = await findMediaFileByName(state.mediaDirHandle, sc.localImageName);
-              if (fh) {
-                const url = await fileHandleToObjectUrl(fh);
-                next = { ...next, photoRef: url };
-              }
+              const fh = await resolveFile(sc.localImageName);
+              if (fh) next = { ...next, photoRef: await fileHandleToObjectUrl(fh) };
             } catch (err) {
               console.error(err);
             }
           }
           if (sc.localVideoName && !sc.localVideoUrl) {
             try {
-              const fh = await findMediaFileByName(state.mediaDirHandle, sc.localVideoName);
-              if (fh) {
-                const url = await fileHandleToObjectUrl(fh);
-                next = { ...next, localVideoUrl: url };
-              }
+              const fh = await resolveFile(sc.localVideoName);
+              if (fh) next = { ...next, localVideoUrl: await fileHandleToObjectUrl(fh) };
             } catch (err) {
               console.error(err);
             }
@@ -794,6 +959,70 @@ export const useStore = create<AppState>((set, get) => {
       set({ scenes: updated });
     },
 
+    // 2026-07-27(4): "비슷한 이미지 추천"용 프로젝트 미디어 분석 캐시. 저장 폴더 안
+    // projects/<프로젝트명>/media_analysis.json에 그대로 저장/재사용됩니다(섹션 상단
+    // MediaAnalysisEntry, analyzeMediaFileName 참고).
+    mediaAnalysisCache: {},
+    ensureProjectMediaAnalysis: async () => {
+      const state = get();
+      if (!state.saveDirHandle || state.saveDirSource !== 'external') return [];
+      const projectName = state.currentProject?.name || '임시_프로젝트';
+      try {
+        const dataDir = await getDataDir(state.saveDirHandle);
+        const projectDir = await getProjectDir(dataDir, projectName);
+        const mediaDir = await getProjectMediaDir(dataDir, projectName);
+        const files = await listMediaFiles(mediaDir, 1);
+
+        // 폴더 지정된 경우, 이미 분석해둔 데이터가 있으면(메모리 캐시 우선, 없으면
+        // media_analysis.json 파일) 그대로 사용하고 새 파일만 추가로 분석합니다.
+        let existing: MediaAnalysisEntry[] | undefined = get().mediaAnalysisCache[projectName];
+        if (!existing) {
+          const stored = await readJsonFileIfExists(projectDir, MEDIA_ANALYSIS_FILE_NAME);
+          existing = Array.isArray(stored?.entries) ? stored.entries : [];
+        }
+        const existingByPath = new Map((existing ?? []).map((e) => [e.path, e]));
+
+        let changed = false;
+        const merged: MediaAnalysisEntry[] = [];
+        for (const f of files) {
+          let size = 0;
+          let lastModified = 0;
+          try {
+            const file = await f.handle.getFile();
+            size = file.size;
+            lastModified = file.lastModified;
+          } catch (err) {
+            console.error(err);
+          }
+          const prev = existingByPath.get(f.path);
+          if (prev && prev.size === size && prev.lastModified === lastModified) {
+            merged.push(prev);
+            continue;
+          }
+          // 새 파일이거나 내용이 바뀐 파일 — 데이터가 없으므로 새로 생성합니다.
+          changed = true;
+          const { tags, caption } = analyzeMediaFileName(f.name, f.kind);
+          merged.push({ path: f.path, kind: f.kind, size, lastModified, tags, caption, analyzedAt: new Date().toISOString() });
+        }
+        // 파일이 삭제되어 목록에서 빠진 항목도 자동으로 걸러집니다(merged가 곧 최신 목록).
+        if (changed || merged.length !== (existing?.length ?? 0)) {
+          try {
+            await writeJsonFile(projectDir, MEDIA_ANALYSIS_FILE_NAME, {
+              updatedAt: new Date().toISOString(),
+              entries: merged,
+            });
+          } catch (err) {
+            console.error(err);
+          }
+        }
+        set((s) => ({ mediaAnalysisCache: { ...s.mediaAnalysisCache, [projectName]: merged } }));
+        return merged;
+      } catch (err) {
+        console.error(err);
+        return [];
+      }
+    },
+
     // ── 블로그 데이터 폴더 ────────────────────────────────────────────────
     blogDirHandle: null,
     blogDirName: null,
@@ -802,11 +1031,11 @@ export const useStore = create<AppState>((set, get) => {
     blogCategories: [],
     blogAuthorLabels: { gyeongwoo: '경우', jungmin: '정민', other: '기타' },
     connectBlogDataFolder: async () => {
-      const handle = await pickDirectory('read');
-      if (!handle) return { ok: false, message: '폴더 선택이 취소되었습니다.' };
-      const granted = await verifyPermission(handle, 'read');
-      if (!granted) return { ok: false, message: '폴더 읽기 권한이 거부되었습니다.' };
       try {
+        const handle = await pickDirectory('read');
+        if (!handle) return { ok: false, message: '폴더 선택이 취소되었습니다.' };
+        const granted = await verifyPermission(handle, 'read');
+        if (!granted) return { ok: false, message: '폴더 읽기 권한이 거부되었습니다.' };
         const data = await readBlogData(handle);
         if (data.posts.length === 0) {
           return {
@@ -831,7 +1060,7 @@ export const useStore = create<AppState>((set, get) => {
         };
       } catch (err) {
         console.error(err);
-        return { ok: false, message: '블로그 데이터를 읽는 중 문제가 발생했습니다.' };
+        return { ok: false, message: describeFolderPickError(err) };
       }
     },
     disconnectBlogDataFolder: () => {
