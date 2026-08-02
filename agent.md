@@ -42,7 +42,7 @@ yarn start     # build && start
 
 ```
 app/layout.tsx, app/page.tsx, app/globals.css   Next.js 엔트리 (html/body는 h-full + overflow-hidden 고정)
-components/AppRoot.tsx    전체 UI. 하나의 파일에 모든 화면/모달 컴포넌트가 들어있음 (3,600줄+)
+components/AppRoot.tsx    전체 UI. 하나의 파일에 모든 화면/모달 컴포넌트가 들어있음 (4,500줄+)
 store/useStore.ts         zustand 전역 상태 — 씬, 채팅, 수정이력, 저장/미디어/블로그 폴더 연결,
                           LM Studio·FFmpeg 설정, 저장 로직
 lib/fsAccess.ts           File System Access API 래퍼 (폴더/파일 읽기·쓰기, 권한 확인, 미디어 스캔)
@@ -92,27 +92,53 @@ public/sample-media/      캡션 없는 샘플 사진/영상 폴더 — 미디�
     app_state.json          # 현재 씬 목록, 다크모드, 선택된 씬, currentProject 메타
     chat_history.json       # 채팅 인터페이스 전체 메시지
     edit_log.json           # 수정 이력 (최대 500개, 오래된 것부터 제거)
-    projects/                # "새 프로젝트"로 이름 붙여 저장한 프로젝트 JSON들
-    exports/                 # 내보내기 시 "저장 폴더에도 저장" 체크 시 생기는 JSON/TXT
+    projects/
+      <프로젝트명>/
+        media/               # 이 프로젝트에 등록한 사진/영상 원본 파일 (실제 복사본)
+        media_analysis.json  # media/ 폴더 안 파일별 태그·설명 캐시 (재분석 없이 재사용)
+      <이름>.json             # "새 프로젝트"로 이름 붙여 저장한 프로젝트 스냅샷들
 ```
 
-관련 상수: `lib/fsAccess.ts`의 `DATA_DIR_NAME`, `PROJECTS_DIR_NAME`.
+> ⚠️ `exports/` 폴더는 **더 이상 만들어지지 않습니다.** 예전에는 내보내기 시 "저장 폴더에도
+> 중복 저장" 체크박스(`alsoSaveToFolder`)가 `KWJMvideoAI_data/exports/`에 JSON/TXT를 남겼지만,
+> 2026-08-01에 내보내기 흐름이 `showSaveFilePicker` 저장 대화상자 하나로 통합되면서 이 체크박스와
+> `writeExportToSaveFolder`가 완전히 제거됐습니다(13절 2026-08-01 항목 참고). 코드에 없는 폴더를
+> 문서에 다시 등장시키지 마세요.
+
+관련 상수: `lib/fsAccess.ts`의 `DATA_DIR_NAME`, `PROJECTS_DIR_NAME`, `MEDIA_ANALYSIS_FILE_NAME`.
 관련 파일명 상수: `store/useStore.ts`의 `APP_STATE_FILE`, `CHAT_HISTORY_FILE`, `EDIT_LOG_FILE`.
 
-### 4.3 미디어(이미지/영상) 폴더는 별개
+### 4.3 미디어(이미지/영상)도 저장 폴더 안에 실제 파일로 저장됩니다 (2026-07-27(2) 이후 — 이전 구조 아님, 주의)
 
-사용자의 요구사항대로 "이미지·영상은 별도 폴더 선택, 나머지 텍스트/기록은 저장 폴더에 저장"을
-그대로 구현했습니다:
+> ⚠️ 초기 버전에는 "이미지·영상은 별도 미디어 폴더에서 참조만 하고, 저장 폴더에는 파일명만
+> 남긴다"는 구조(`mediaDirHandle`를 따로 연결)가 있었습니다. **2026-07-27(2)에 이 "미디어 폴더
+> 연결" 개념을 완전히 제거하고 저장 폴더 하나로 통합했습니다.** 아래가 현재 진실이고, 13절의
+> 오래된 changelog 항목(2026-07-20 등)에 남아있는 `mediaDirHandle` 관련 기록은 그 변화 과정을
+> 보여주는 역사 기록일 뿐이니 되살리지 마세요.
 
-- 이미지/영상 원본 파일은 **저장 폴더로 복사되지 않습니다.**
-- `mediaDirHandle`(별도로 연결하는 폴더)에서 파일을 찾아 `URL.createObjectURL()`로 미리보기만 만듭니다.
-- 씬(Scene)에는 `localImageName` / `localVideoName`처럼 **파일명만** 저장됩니다 (텍스트라서 가볍습니다).
+- 사용자가 스토리보드 편집기에서 "등록" 버튼으로 사진/영상 파일을 고르면, 그 파일은
+  `KWJMvideoAI_data/projects/<프로젝트명>/media/`에 **실제로 복사되어 저장**됩니다
+  (`uploadPhotoToScene`/`uploadVideoToScene` → `getProjectMediaDir()` → `writeBinaryFile()`).
+  이름 충돌을 피하려고 `buildUniqueMediaFileName()`이 타임스탬프를 붙인 파일명을 씁니다.
+  이렇게 하면 사용자가 탐색기에서도 프로젝트별 사진/영상을 바로 볼 수 있습니다.
+- 씬(Scene)에는 `localImageName` / `localVideoName`처럼 **파일명만** 저장되고, 화면 표시용
+  미리보기는 그 파일 핸들에서 만든 `URL.createObjectURL()` blob URL을 씁니다.
 - 저장 시 blob: URL은 세션이 끝나면 무효가 되므로, `sanitizeSceneForSave()`가 JSON에 쓰기 전에
-  blob URL을 비우고 파일명만 남깁니다. 다음 세션에 미디어 폴더를 다시 연결하면
-  `resyncMediaReferences()`(store)가 파일명으로 다시 찾아서 미리보기를 복원합니다.
-- 미디어 폴더를 아직 연결하지 않았거나 파일을 못 찾으면 `lib/utils.ts`의 `LOCAL_MEDIA_PLACEHOLDER`
-  (회색 자리표시자 SVG)가 대신 표시됩니다. `getSceneImageSrc()`를 항상 `<img src>`에 사용하세요 —
-  씬의 `photoRef`를 직접 넣지 마세요.
+  blob URL을 비우고 파일명만 남깁니다. 다음에 같은 저장 폴더를 다시 연결하면
+  `resyncMediaReferences()`(store)가 `projects/<프로젝트명>/media/` 안에서 파일명으로 다시
+  찾아 미리보기를 복원합니다.
+- 파일을 아직 찾지 못했거나(예: 파일이 폴더 밖에서 지워짐) 저장 폴더가 아직 연결되지 않았으면
+  `lib/utils.ts`의 `LOCAL_MEDIA_PLACEHOLDER`(회색 자리표시자 SVG)가 대신 표시됩니다.
+  `getSceneImageSrc()`를 항상 `<img src>`에 사용하세요 — 씬의 `photoRef`를 직접 넣지 마세요.
+- `media_analysis.json`(`MEDIA_ANALYSIS_FILE_NAME`)은 `media/` 폴더와 나란히 프로젝트 폴더에
+  저장되는 캐시 파일로, 파일별 태그/설명을 담아 같은 폴더를 다시 열었을 때 재분석 없이 재사용합니다.
+- 참고: `MediaLibraryModal`("미디어 라이브러리")도 별도 폴더가 아니라 바로 이 현재 프로젝트의
+  `projects/<프로젝트명>/media/` 폴더를 그대로 보여줍니다(`store.listProjectMediaFiles`,
+  `addFilesToProjectMedia`) — 저장 폴더가 실제로 연결되어 있어야만(OPFS 자동 저장소만으로는
+  부족) 동작하며, 여기서 파일을 추가하면 위와 똑같이 `media/`에 실제 복사됩니다. 반면
+  `BlogImportModal`("블로그에서 가져오기")은 이것과 완전히 별개로, **사용자가 이미 갖고 있는**
+  블로그 데이터 폴더(6절 참고)를 읽기 전용으로 스캔·참조합니다 — 그쪽은 저장 폴더로 파일을
+  복사하지 않고 File System Access API로 원본 폴더의 파일을 직접 가리키기만 합니다.
 
 ### 4.4 자동저장 & 수정 이력
 
@@ -126,14 +152,140 @@ public/sample-media/      캡션 없는 샘플 사진/영상 폴더 — 미디�
 - 저장은 항상 `saveDirHandle`이 연결되어 있을 때만 동작합니다. 연결 전에는 앱이 정상 동작하되
   실제 파일에는 아무것도 쓰이지 않습니다 (메모리에서만 동작하는 데모 상태).
 
-### 4.5 새 프로젝트 / 불러오기
+### 4.5 새 프로젝트 / 폴더 연결 = 프로젝트 열기 (2026-08-02 변경 — 이전 구조 아님, 주의)
 
-- "새 프로젝트"는 더 이상 자체 폴더 선택기를 갖지 않습니다. 전역 저장 폴더(`saveDirHandle`)를 사용해
-  `KWJMvideoAI_data/projects/<이름>.json`에 씁니다 (`store.saveNamedProject`).
-- "불러오기" 모달은 3단 구조입니다: ① 연결된 저장 폴더의 projects 목록(자동 조회,
-  `store.listNamedProjects`) ② 임의의 다른 폴더에서 JSON 찾아 불러오기(레거시 호환, 폴더를
-  새로 골라야 함) ③ 샘플 프로젝트(데모 데이터, 실제 파일 아님 — `savedProjects` in-memory 배열).
-  이 3단 구조를 유지하거나 개선하되, "샘플"과 "실제 저장된 것"을 섞어서 헷갈리게 만들지 마세요.
+> ⚠️ 예전에는 "불러오기" 모달(`LoadModal`)이 있었고, 헤더의 "가져오기" 버튼이 그 모달로 가는
+> 진입점 중 하나였습니다. **2026-08-02에 이 구조를 완전히 제거했습니다.** 이 문서의 아래
+> 오래된 changelog 항목(2026-07-27 등)에는 `LoadModal`/`ImportHubModal`을 만들었다는 기록이
+> 남아있지만, 그 컴포넌트들은 **더 이상 코드에 존재하지 않습니다.** 이 섹션(4.5)이 현재 진실이고,
+> changelog는 그 변화 과정을 보여주는 역사 기록일 뿐이니 changelog를 보고 되살리지 마세요.
+
+- **"저장 폴더 연결" = "이 폴더의 프로젝트 열기"**: 사용자가 헤더의 "저장 폴더 연결"로 폴더를
+  고르면(`store.connectSaveFolder` → `attachSaveDir`), 그 폴더 안 `KWJMvideoAI_data/app_state.json`에
+  저장된 장면이 있으면 자동으로 불러와 편집기로 전환합니다. **더 이상 "불러오기" 목록에서
+  프로젝트를 고르는 단계가 없습니다** — 폴더를 연결하는 행위 자체가 곧 그 프로젝트를 여는
+  행위입니다 (1폴더 = 1작업중 프로젝트 모델).
+- **빈 폴더에 새로 연결하면 빈 데이터로 시작**: `attachSaveDir`가 그 폴더에서 `app_state.json`을
+  찾지 못하면(완전히 새 폴더이거나 아직 한 번도 저장한 적 없는 폴더), 메모리에 남아있던
+  이전 폴더/세션의 장면·채팅·수정이력을 그대로 들고 있지 않도록 **명시적으로 빈 상태로
+  초기화**합니다(`scenes: []`, `chatMessages: [INITIAL_CHAT_MESSAGE]`, `editLog: []`,
+  `currentProject: null`). 그 직후 `saveAllToFolder({silent:true})`를 한 번 호출해서, 사용자가
+  아직 아무 편집도 하지 않았어도 `KWJMvideoAI_data/app_state.json` 등 빈 데이터 파일이 폴더
+  안에 바로 생성되도록 합니다("폴더에 데이터가 없으면 빈 데이터를 다시 생성해야 한다"는
+  요구사항). 이 초기화는 `source === 'external'`(진짜 사용자가 고른 폴더)일 때만 일어나고,
+  브라우저 내부 자동 저장소(OPFS, 아직 실제 폴더를 안 고른 기본 상태)에는 적용되지 않습니다.
+- **헤더의 "가져오기" 버튼은 이제 "블로그에서 가져오기" 전용입니다**: 예전의 3카드 허브
+  (`ImportHubModal`: 불러오기/미디어 라이브러리/블로그에서 가져오기)를 완전히 제거하고,
+  헤더 버튼 하나가 곧바로 `BlogImportModal`을 엽니다(`setModal('blog-import')`). "미디어
+  라이브러리"는 헤더에서 사라졌지만 기능 자체는 그대로 남아있고, `SceneEditor`의 "미디어
+  라이브러리에서 변경" 링크(`setModal('media')`)로 계속 열 수 있습니다.
+- **"새 프로젝트"는 그대로 유지**: 여전히 전역 저장 폴더 안 `KWJMvideoAI_data/projects/<이름>.json`에
+  이름을 붙여 스냅샷을 저장할 수 있습니다(`store.saveNamedProject`, `NewProjectModal`). 다만
+  그렇게 저장한 이름 붙은 프로젝트를 목록에서 골라 "불러오는" UI는 없어졌습니다 — 필요하면
+  `store.listNamedProjects`/`loadNamedProject`/`deleteNamedProject`가 스토어에 여전히 남아있으니
+  이를 다시 노출하는 UI를 새로 만들 수 있습니다(현재는 어떤 화면도 호출하지 않는 상태).
+- **새 기능을 추가할 때 이 모델을 깨지 마세요**: "여러 프로젝트 중 하나를 고르는 화면"을
+  다시 만들고 싶다면, 최소한 "폴더 연결 = 그 폴더 프로젝트 자동 오픈" 동작은 그대로 둔 채
+  추가하세요(사용자가 명시적으로 "여러 프로젝트를 관리하고 싶다"고 요청하기 전까지는).
+
+### 4.6 장면당 사진/영상은 항상 최대 1개 (2026-08-02 추가 — 핵심 불변식)
+
+**한 장면(Scene)에는 사진이든 영상이든 최종적으로 하나만 등록될 수 있습니다.** 예전에는
+`applyImageToScene`/`applyLocalVideoToScene`/`uploadPhotoToScene`/`uploadVideoToScene`가 서로
+다른 필드(`photoRef`+`localImageName` vs `localVideoName`+`localVideoUrl`)만 갱신하고 반대쪽
+필드를 지우지 않아서, 사진을 적용한 뒤 영상을 적용하면(혹은 그 반대) 두 참조가 동시에 남아
+장면 카드에 "사진 배지"와 "영상 배지"가 함께 뜨는 등 타임라인에 중복 등록된 것처럼 보이는
+버그가 있었습니다. **이 네 함수는 전부 자신과 반대되는 미디어 타입의 필드를 항상 함께
+지우도록 고쳐졌습니다** — 새로운 미디어 적용/업로드 함수를 추가하거나 이 함수들을 리팩터링할
+때 이 불변식을 절대 깨지 마세요.
+
+- **토글(등록 취소)**: `store.clearSceneMedia(id)`가 장면의 `photoRef`/`localImageName`/
+  `localVideoName`/`localVideoUrl`/`sourcePostId`/`sourceMediaId`를 전부 비웁니다.
+  `RecommendPanel`(`components/AppRoot.tsx`)의 "이 장면 전용 등록" 썸네일과 AI 추천 4칸
+  양쪽 모두, 이미 적용된 항목을 다시 누르면 이 함수를 호출해 등록을 취소합니다(토글). 다른
+  항목을 누르면 위 불변식 덕분에 store가 알아서 기존 것을 대체하므로 별도 처리가 필요 없습니다.
+- **등록 버튼은 사진/영상 통합 1개**: `RecommendPanel`의 "등록" 버튼은 `accept="image/*,video/*"`
+  하나의 파일 입력만 가지고, 고른 파일의 MIME 타입으로 사진/영상 여부를 스스로 판별합니다
+  (`handleRegisterFile`). 사진용/영상용 버튼을 다시 둘로 나누지 마세요 — 요청사항이었습니다.
+- **영상은 재생시간이 실제 영상 길이에 자동 고정됩니다**: `store/useStore.ts`의
+  `getVideoDurationSeconds(url)`가 숨은 `<video>` 엘리먼트로 실제 재생 길이를 읽어,
+  `applyLocalVideoToScene`/`uploadVideoToScene`가 `scene.duration`을 그 값으로 그대로
+  덮어씁니다(0.1초 단위 반올림). 이 값은 **아래 재생시간 슬라이더의 10초 상한과 무관하게**
+  적용됩니다(제한 시간보다 긴 영상도 영상 길이 그대로 씁니다). `SceneEditor`는
+  `scene.localVideoUrl`이 있으면 재생시간 슬라이더를 `disabled`로 잠그고 "영상 길이에 고정"
+  안내문을 보여줍니다 — 사진으로 바꾸면(위 불변식에 따라 `localVideoUrl`이 지워지므로) 다시
+  직접 조절할 수 있게 됩니다.
+- **재생시간 슬라이더 범위**: 2026-08-02부터 `min=0.1, max=10, step=0.1`입니다(예전에는
+  `min=1, max=20`, 정수만). `lib/subtitles.ts`의 `MAX_AUTO_SCENE_SECONDS`(AI가 자동으로
+  스토리보드를 만들 때 씬에 붙이는 재생시간의 상한)도 20→10으로 함께 낮춰서, AI가 만든
+  값도 항상 슬라이더 범위 안에 들어오도록 맞췄습니다. 이 두 상수(슬라이더 max, `MAX_AUTO_SCENE_SECONDS`)는
+  같이 바꾸세요 — 둘 중 하나만 바꾸면 AI가 만든 재생시간이 슬라이더에서 잘리거나 어긋나 보입니다.
+
+### 4.7 장면 미리보기 화면비율 처리 — `MediaFrame` (2026-08-02 추가)
+
+요청사항: "가로 사진/영상은 가로가 꽉 차게, 세로 사진/영상은 세로가 꽉 차게 해서 내용이 전부
+보이게 하고, 빈 공간(레터박스/필러박스)은 첫 프레임을 스크린샷 찍어 흐리게 채운다."
+
+`components/AppRoot.tsx`의 `MediaFrame` 컴포넌트(`SceneEditor`의 큰 미리보기 영역에서 사용)가
+이를 구현합니다:
+
+- 실제 컨텐츠는 `object-contain`으로 렌더링합니다. `object-contain`은 원본 가로세로 비율을
+  유지한 채 부모(16:9 `aspect-video`) 안에 맞추므로, 가로로 넓은 미디어는 자동으로 가로가
+  꽉 차고(위아래 여백), 세로로 긴 미디어는 세로가 꽉 차게(좌우 여백) 배치되어 **잘리는 부분
+  없이 항상 전체 내용이 보입니다.** (예전에는 `object-cover`를 써서 화면비율이 다른 미디어의
+  일부가 잘려 나갔습니다.)
+- 그 여백(레터박스/필러박스)을 검은 배경 그대로 두지 않고, 같은 미디어의 첫 프레임을 캡처해
+  확대(`scale-110`)·블러(`blur-2xl`) 처리한 것을 배경 레이어로 깔아 채웁니다.
+  - 사진은 그 자체가 이미 "첫 프레임"이라 바로 블러 배경으로 씁니다.
+  - 영상은 숨겨진 `<video>` 엘리먼트를 하나 더 만들어 `currentTime = 0.05`로 이동한 뒤
+    `<canvas>`에 그려서 `toDataURL('image/jpeg', 0.7)`로 정지 이미지를 "스크린샷"처럼
+    캡처합니다(실제로 재생되는 컨트롤 있는 영상과는 별개의 인스턴스라 서로 간섭하지 않습니다).
+    캡처에 실패해도(코덱/브라우저 제약 등) 전체 기능이 깨지지 않도록 검은 배경으로 조용히
+    대체됩니다.
+- **적용 범위는 스토리보드 편집기 화면뿐입니다.** MP4 내보내기(`app/api/export/video/route.ts`의
+  실제 ffmpeg 렌더링)는 이번 변경에 포함되지 않았습니다 — 요청사항이 "스토리보드 편집기에서"로
+  명시되어 있었기 때문입니다. 최종 MP4 출력에도 같은 레터박스+블러 배경 처리가 필요하다면,
+  ffmpeg 필터 그래프에 `scale`(비율 유지) + `boxblur`/`gblur` + `overlay`를 추가하는 별도
+  작업이 필요합니다(현재는 여전히 화면을 꽉 채우는 단순 스케일/크롭 방식일 가능성이 높으니
+  이 부분을 건드리기 전에 `route.ts`의 현재 필터 체인을 먼저 확인하세요).
+
+### 4.8 저장 폴더 연결 해제 / 재연결 안전장치 (2026-08-02(2) 버그 수정 — 반드시 유지할 것)
+
+**증상**: 저장 폴더 연결을 해제한 뒤 "새 폴더"로 다시 연결하려 하면 브라우저 탭/창이 강제로
+닫혔고, 브라우저를 다시 열어 연결을 시도해도 같은 문제가 계속 반복됐습니다.
+
+**원인 ①**: `disconnectSaveFolder()`가 메모리 상태(`saveDirHandle` 등)만 지우고, IndexedDB에
+남아있는 "기억해둔 폴더" 참조(`rememberDirectoryHandle`/`REMEMBERED_SAVE_DIR_KEY`, `lib/fsAccess.ts`)는
+그대로 두고 있었습니다. 그 결과 연결 해제 후 다시 폴더 연결 화면(`FolderConnectGate`)으로 가면
+`rememberedSaveDirName`이 여전히 남아있어, 화면이 항상 "이전 폴더로 다시 연결"만 시도했고 진짜
+"새 폴더 선택" 창을 열 방법이 없었습니다. 그 "기억된 폴더"가 이동/삭제/손상된 상태면, 재연결
+시도 자체가 반복적으로 실패하며 문제로 이어질 수 있었습니다.
+
+**원인 ②**: 기억된 폴더로 자동 재연결(`initStorage()`)을 시도하는 도중에 탭/브라우저가 죽어버리면,
+다음에 앱을 다시 열 때도 똑같이 그 폴더로 자동 재연결을 또 시도해서 같은 문제가 매번 반복될 수
+있는 구조였습니다.
+
+**적용한 수정** (`store/useStore.ts`, `components/AppRoot.tsx`):
+
+- `disconnectSaveFolder()`가 이제 `forgetRememberedDirectoryHandle(REMEMBERED_SAVE_DIR_KEY)`를
+  함께 호출하고 `rememberedSaveDirName`도 `null`로 초기화합니다. 연결을 끊으면 다음엔 항상
+  "새 폴더 선택" 창이 바로 뜹니다.
+- `initStorage()`에 재연결 진행 플래그(`RECONNECT_IN_PROGRESS_KEY`, `localStorage`)를 추가했습니다.
+  기억된 폴더로 자동 재연결을 **시도하기 직전**에 이 플래그를 `'1'`로 저장하고, 성공/실패가
+  **확정된 뒤**에만 지웁니다. 다음 실행 때 이 플래그가 여전히 남아있으면(=지난번 시도가 끝까지
+  완료되지 못했다는 신호) 이번에는 같은 폴더로 자동 재시도하지 않고 `forgetRememberedDirectoryHandle()`로
+  기억해둔 폴더 참조까지 함께 지운 뒤 포기합니다 — 문제 있는 폴더에 계속 갇히지 않기 위함입니다.
+  `sessionStorage`가 아니라 `localStorage`를 쓰는 이유는 탭이 죽는 경우 `sessionStorage`도 함께
+  사라져 신호가 남지 않기 때문입니다.
+- `FolderConnectGate`(폴더 연결 화면)와 `SaveFolderOfflineBanner`(상단 경고 배너) 양쪽에
+  "다른(새) 폴더 선택하기" 버튼을 추가했습니다. 내부적으로 `disconnectSaveFolder()`로 기억해둔
+  참조를 먼저 지운 뒤 `connectSaveFolder()`(폴더 선택 다이얼로그)를 엽니다 — 문제 있는 폴더에
+  갇혔을 때 언제든 탈출할 수 있는 명시적인 진입점입니다.
+
+**앞으로 이 영역을 손볼 때 지킬 것**: 저장 폴더 관련 상태를 지우는 새 코드를 추가할 때는
+`saveDirHandle` 같은 메모리 상태와 `REMEMBERED_SAVE_DIR_KEY`(IndexedDB) 같은 영속 참조를
+**항상 짝지어** 정리하세요. 하나만 지우면 화면 상태와 실제로 기억된 폴더가 어긋나는 이번과
+같은 버그가 다시 생깁니다.
 
 ## 5. 채팅 → 스토리보드 흐름 (핵심 UX)
 
@@ -176,7 +328,35 @@ public/sample-media/      캡션 없는 샘플 사진/영상 폴더 — 미디�
 않으므로, 사용자가 편집기에서 직접 지정한 duration에는 영향이 없습니다(이 함수는 오직 AI
 생성 시점에만 호출됩니다).
 
+## 5.3 타임라인 전체 AI 생성 (2026-08-02 추가)
 
+이미 여러 장면에 사진/영상이 등록되어 있고 제목·나레이션·대사만 AI로 다시 쓰고 싶을 때 쓰는
+기능입니다. `EditorInterface`의 타임라인 패널(좌측) 헤더 바로 아래 "텍스트 AI로 생성" 버튼이
+이를 실행합니다(`handleGenerateAllScenes`).
+
+- **한 번의 요청으로 전체 장면을 함께 보냅니다.** `SceneEditor`의 장면별 "AI 재생성"
+  (`regenerateSceneNarration`)은 장면 하나씩만 다시 쓰므로 앞뒤 문맥을 모릅니다. 반면
+  `lib/llm.ts`의 `regenerateAllScenesForTimeline({ scenes, settings })`는 **모든 장면의 목록을
+  순서대로 한 프롬프트에 실어** LLM에 보내, "하나의 영화·다큐멘터리처럼 이어지는 이야기"를
+  쓰도록 지시합니다(요청사항). 장면을 하나씩 반복 요청하는 방식으로 리팩터링하지 마세요 —
+  그러면 다시 앞뒤 문맥이 끊깁니다.
+- **미디어 근거는 파일명뿐입니다.** 아래 섹션(현재 10번, "알려진 제약")에 설명된 대로 현재
+  연결 가능한 LM Studio 모델은 텍스트 전용이라 사진/영상을 실제로 "보지" 못합니다.
+  `describeSceneMedia()`가 각 장면의 `localVideoName`/`localImageName`/`photoRef` 유무로
+  "사진"/"영상"/"없음"만 판별해 파일명과 함께 프롬프트에 실어줍니다 — 이 프로젝트의 다른
+  스토리보드 생성 함수들과 동일한 설계 원칙입니다(추측성 실제 사실 창작 금지, 분위기 있는
+  서술은 허용).
+- **결과는 항상 안전합니다.** 반환 배열은 입력 `scenes`와 길이·순서가 항상 같고
+  (`generateJsonWithGuaranteedFallback` 재사용), LLM 호출이 실패하면 각 장면의 기존
+  제목/나레이션/대사를 그대로 돌려주는 폴백을 씁니다 — 즉 이 버튼을 눌러서 장면이 비거나
+  사라지는 일은 없습니다.
+- **적용은 한 번의 스토어 액션으로 처리합니다.** 장면 수만큼 `updateScene()`을 반복 호출하면
+  자동저장/수정이력이 그만큼 여러 번 트리거되므로, `store.applyBulkSceneContent(updates)`를
+  새로 추가해 모든 장면을 한 번의 `set()`으로 갱신하고 수정이력 한 줄 + 자동저장 한 번만
+  발생하도록 했습니다. 비슷한 "여러 장면 일괄 수정" 기능을 추가할 때 이 패턴을 재사용하세요.
+
+
+## 6. 블로그 데이터 연동 (경우정민 블로그 프로젝트 읽기)
 
 이 앱은 "경우정민 블로그" 프로젝트(별도 저장소, `sampledata`)가 만드는 데이터 폴더를 **그 블로그
 서버를 실행하지 않고도** 직접 읽습니다. 블로그 쪽 `aiagent.md`에 정의된 계약을 그대로 따릅니다:
@@ -306,8 +486,15 @@ Next.js 서버까지 연결한 end-to-end 테스트(`yarn dev` 구동)는 네트
 - **MP4 내보내기의 오디오**: 현재 배경음악/원본 영상 오디오를 포함하지 않습니다 (자막만 입힙니다).
   영상 클립의 원음을 살리려면 `app/api/export/video/route.ts`의 세그먼트 인코딩 단계에서 `-an`을
   제거하고 오디오 트랙 믹싱 로직을 추가해야 합니다.
-- **`yarn install`/`yarn build` 미검증**: 섹션 12 참고 (2026-07-23 세션도 동일하게 네트워크가
-  막힌 샌드박스였습니다).
+- **`yarn install`/`yarn build` 검증 상태**: 2026-08-01, 2026-08-02 세션 모두 네트워크가 열려있어
+  `npm install`(또는 `yarn install`) 후 `npx tsc --noEmit` + `next build`까지 실행해 정상 빌드를
+  확인했습니다. 다만 실제 LM Studio 서버 연결, 실제 브라우저의 File System Access API 동작,
+  실제 FFmpeg 렌더링은 매번 사람이 실기기에서 확인해야 합니다(자동화된 E2E 테스트 없음).
+- **MP4 내보내기에는 미리보기의 레터박스+블러 배경 처리가 없습니다**: 섹션 4.7의 `MediaFrame`
+  (가로/세로 화면비율에 맞춰 여백을 블러 배경으로 채우는 처리)은 스토리보드 편집기 화면에만
+  적용되어 있고, 실제 MP4 렌더링(`app/api/export/video/route.ts`)에는 적용되지 않았습니다
+  (요청 범위가 "스토리보드 편집기에서"로 명시되어 있었기 때문). 최종 영상에도 같은 처리가
+  필요하면 ffmpeg 필터 그래프에 blur 배경 합성을 추가하는 별도 작업이 필요합니다.
 
 ## 11. 코딩 컨벤션
 
@@ -320,18 +507,19 @@ Next.js 서버까지 연결한 end-to-end 테스트(`yarn dev` 구동)는 네트
 - 새로 만드는 저장 관련 함수는 `lib/fsAccess.ts`(순수 파일시스템 유틸)와 `store/useStore.ts`
   (앱 상태 + 언제 저장할지 판단)의 역할 분리를 유지하세요.
 
-## 12. 개발 환경 제약 (이 세션 기준)
+## 12. 개발 환경 제약 (세션마다 다를 수 있음)
 
-이 프로젝트가 마지막으로 수정된 샌드박스 환경은 **npm 레지스트리에 네트워크 접근이 차단**되어
-있었습니다. 그래서:
+이 프로젝트를 처음 만든 샌드박스 환경은 **npm 레지스트리에 네트워크 접근이 차단**되어 있어서
+`yarn install`/`yarn build`로 끝까지 검증하지 못하고 구문 검사(esbuild/`tsc` transpile)로만
+확인했던 세션들이 있었습니다(2026-07-20 ~ 2026-07-23 기록 참고). **2026-08-01, 2026-08-02
+세션은 네트워크가 열려 있어 `npm install`(또는 `yarn install`) 후 `npx tsc --noEmit`과
+`next build`까지 실제로 실행해 성공을 확인했습니다.** 즉 네트워크 제약은 이 프로젝트의
+고정 속성이 아니라 세션(샌드박스)마다 다를 수 있는 조건입니다:
 
-- `node_modules` 없이 코드를 작성했고, 실제 `yarn install && yarn build`로 최종 검증하지 못했습니다.
-  대신 `esbuild`(전역 설치된 `tsx` 패키지에 번들된 것)로 모든 `.ts`/`.tsx` 파일의 **구문 오류**만
-  점검했습니다 (타입 오류까지는 잡지 못합니다 — `@types/react` 등이 없어 완전한 타입체크가
-  불가능했습니다). FFmpeg 파이프라인만은 예외적으로 이 샌드박스에 ffmpeg이 실제로 설치되어 있어
-  더미 이미지/영상으로 전체 명령어 시퀀스(세그먼트 인코딩→concat→자막 굽기)를 진짜로 실행해 검증했습니다.
-- **다음에 이 프로젝트를 여는 AI(또는 사람)는 가장 먼저 `yarn install && yarn build`를 실행해서
-  실제로 빌드가 되는지 확인하세요.** 문제가 있다면 대부분 import 경로나 타입 사소한 불일치일
+- **다음에 이 프로젝트를 여는 AI(또는 사람)는 가장 먼저 `yarn install && yarn build`(또는
+  `npm install && npx next build`)를 실행해서 실제로 빌드가 되는지 확인하세요.** 네트워크가
+  막힌 샌드박스라면 최소한 `npx tsc --noEmit`으로 구문+타입 오류라도 잡아두세요. 문제가 있다면
+  대부분 import 경로나 타입 사소한 불일치일
   가능성이 높습니다. 그다음 `yarn dev`로 LM Studio 연동(설정에서 "연결 확인")과 FFmpeg 내보내기
   ("설정"에서 "FFmpeg 확인" 후 실제 내보내기 1회)를 반드시 실기기에서 확인하세요.
 
@@ -729,6 +917,233 @@ Next.js 서버까지 연결한 end-to-end 테스트(`yarn dev` 구동)는 네트
 확인해보시길 권장드립니다. 또한 실제 LM Studio에서 `/no_think` 지시어가 잘 인식되는지
 (Qwen3 계열이 아닌 다른 모델을 쓰는 경우 이 지시어가 텍스트로 그대로 노출될 수 있음)는
 실기기에서 확인이 필요합니다.
+
+## 2026-08-01 — 블로그 오디오 데이터 불러오기 + 장면 제목/대사 AI 생성 + 태그 UI 제거 +
+이미지 권장 크기 안내 + 채팅기록 초기화 버튼 + 저장 폴더 연결 끊김 자동복구/배너 +
+내보내기 개편(스크립트 명칭/미디어 ZIP/저장 위치 선택)
+
+사용자 피드백 요약: (1) 블로그 데이터 중 오디오가 통째로 안 불러와짐, (2) 채팅 탭에
+채팅기록 초기화 버튼이 필요함, (3) 장면 나레이션 AI 재생성이 실제로는 연결되어 있는데도
+"LM Studio에 연결하지 못했습니다"만 뜸 + 제목/대사도 AI 생성 가능해야 함 + 태그 UI 제거,
+(4) "비슷한 이미지 추천" 쪽에 권장 이미지 px 크기 안내 필요, (5) 저장 폴더 연결이 중간에
+끊겨도 표시가 잘 안 됨 — 임시저장 신뢰성을 높여야 함, (6) 채팅으로 스토리보드 만들 때
+블로그 사진이 잘 들어가야 함, (7) 내보내기: "텍스트 스크립트"→"스크립트" 명칭 변경,
+이미지/영상 파일도 ZIP으로 내보내기, 다운로드 위치를 물어보고(기본 바탕화면) 폴더에
+중복 저장하지 않기, "참고용 경로 메모" 삭제.
+
+1. **블로그 오디오 데이터 불러오기** (`lib/blogData.ts`, `lib/llm.ts`, `components/AppRoot.tsx`)
+   - 블로그(KWJMTORY)는 `<audio>` 태그와 `media-meta.json`의 `type: 'audio'`를 실제로
+     쓰는데(`src/app/lib/mediaMeta.ts`, `audioExtension.ts`), AIvideo 쪽 `parseMediaTagsFromContent`는
+     `<img|video>`만 인식해 오디오 캡션/날짜가 통째로 누락되고 있었습니다. `BlogMediaMeta.type`을
+     `'image' | 'video' | 'audio'`로 넓히고 태그 정규식에 `audio`를 추가해 실제로 불러오도록
+     고쳤습니다.
+   - 오디오는 장면의 사진/영상 자리에 쓸 수 없으므로(재생 미리보기가 아니라 `<img>`/`<video>`로
+     렌더링되는 자리), 아래 지점들을 함께 방어적으로 고쳤습니다 — 그러지 않으면 오디오가
+     "사진"으로 오인되어 깨진 썸네일/장면이 생길 수 있었습니다.
+     - `BlogImportModal`의 글 목록 썸네일(`firstMedia`)이 오디오를 고르지 않도록 이미지/영상만
+       필터링, "사진/영상 N개" 카운트에서 오디오를 분리해 별도 표기("오디오 N개").
+     - `handleBuildStoryboardFromBlog`(AI로 바로 스토리보드 만들기)에서 오디오를 시각 미디어
+       목록에서 제외해, 오디오만 있는 글이 올바르게 "본문 기반 장면"(textOnlyPosts) 경로로
+       가도록 수정. 그 글에 오디오 캡션이 있으면 본문 요약에 덧붙여 정보 손실 없이 반영.
+     - `lib/llm.ts`의 `buildBlogContextText`가 오디오를 "오디오(사진/영상 아님, mediaId로
+       선택 불가)"로 명확히 표시하고, `generateStoryboardFromChat`의 `validMediaIds`도
+       사진/영상만 유효하도록 제한(LLM이 지침을 어기고 오디오 id를 골라도 안전하게 무시).
+     - `resolveScenesWithBlogMedia`(채팅 기반 스토리보드의 장면-미디어 매칭)에서도 오디오
+       mediaId는 한 번 더 걸러 2단계(블로그 사진 추천)/3단계(스톡 이미지)로 자연스럽게
+       대체되도록 방어.
+   - 참고: 오디오를 실제 영상에 트랙으로 합성하는 기능(내레이션/배경음악 믹싱)은 이번
+     범위 밖입니다(기존에도 없던 기능이며, "모든 관련 데이터를 정확히 불러오기" 요구사항은
+     캡션/날짜 등 메타데이터가 누락되지 않는 것으로 충족했습니다).
+
+2. **헤더 채팅 탭 "채팅기록 초기화" 버튼** (`store/useStore.ts`, `components/AppRoot.tsx`)
+   - `resetChatHistory()` 스토어 액션 추가 — 채팅 기록만 처음 인사 메시지로 되돌리고
+     장면/프로젝트는 그대로 둡니다.
+   - 헤더 우측에 `view === 'chat'`일 때만 보이는 버튼을 추가했고, 실수 방지를 위해
+     프로젝트 삭제와 같은 기존 인라인 "확정/취소" 패턴을 그대로 재사용했습니다.
+
+3. **장면 제목/나레이션/대사 AI 생성 + 실제 오류 메시지 표시 + 태그 UI 제거**
+   (`lib/llm.ts`, `components/AppRoot.tsx`)
+   - 버그 원인: `SceneEditor`의 AI 재생성 catch 블록이 `err.message`를 무시하고 항상
+     "LM Studio에 연결하지 못했습니다..." 고정 문구만 보여주고 있었습니다(2026-07-27에
+     `ChatInterface` 쪽만 이 문제를 고쳤고 `SceneEditor`는 그대로였음). 실제 원인(모델 응답
+     형식 오류 등 연결과 무관한 문제)도 전부 "연결 안 됨"으로 오인됐던 원인입니다. 이제
+     `err?.message`를 그대로 보여주도록 고쳤습니다.
+   - `regenerateSceneNarration(params)`에 `target?: 'title' | 'narration' | 'dialogue'`를
+     추가해 세 필드를 독립적으로 AI 생성할 수 있게 했고, JSON 파싱 실패 시 토큰 예산을
+     늘려 한 번 더 재시도하도록 견고화했습니다(`generateJsonWithGuaranteedFallback`과
+     같은 원칙). `SceneEditor`에 제목/대사 필드에도 각각 "AI 생성" 버튼을 추가(공용
+     `renderAiFieldButton` 헬퍼로 결과 팝업까지 재사용).
+   - 요청대로 "태그" UI(장면 편집기의 태그 입력 필드 + 미리보기 오버레이의 `#태그` 칩)를
+     제거했습니다. 단, `scene.tags` 데이터 자체는 "비슷한 이미지 추천" 점수 계산
+     (`scoreBlogMediaForScene`/`scoreProjectMediaForScene`)에서 조용히 쓰이고 있어 데이터
+     필드/LLM 생성 로직은 그대로 두고 화면 표시만 없앴습니다(다른 기능을 건드리지 않기 위함).
+
+4. **"비슷한 이미지 추천" 패널에 권장 이미지 크기(px) 안내** (`components/AppRoot.tsx`)
+   - 패널 헤더 아래에 "가로(16:9) 1920×1080px · 세로(9:16) 1080×1920px 이상" 안내 문구를
+     상시 표시하도록 추가.
+
+5. **저장 폴더 연결 끊김에 대한 자동 복구 + 눈에 띄는 배너** (`store/useStore.ts`,
+   `components/AppRoot.tsx`)
+   - 문제점: `saveAllToFolder`가 권한 재확인에 실패하거나 쓰기 오류가 나면 상태 표시줄의
+     작은 텍스트만 바뀌고 끝이라 놓치기 쉬웠고, 사용자가 다시 편집하기 전까지는 재시도도
+     되지 않았습니다.
+   - `saveAllToFolder` 실패 시 8초 뒤 자동으로 조용히 재시도하는 `scheduleErrorRetry()`를
+     추가(성공하거나 폴더 연결 해제/자동저장 꺼짐 시 스스로 멈춤). 폴더가 다시 정상
+     연결되면(`attachSaveDir`) 예약된 재시도는 정리됩니다.
+   - `LlmOfflineBanner`와 같은 스타일의 `SaveFolderOfflineBanner`를 추가 — 실제 저장 폴더
+     연결(`saveDirSource === 'external'`)에서 저장이 계속 실패할 때만 헤더 아래에 눈에 띄게
+     표시되고, "다시 연결" 버튼으로 즉시 재연결을 시도할 수 있습니다.
+
+6. **채팅으로 스토리보드 만들 때 블로그 사진 반영 확인** (`components/AppRoot.tsx`)
+   - `resolveScenesWithBlogMedia`(1. 블로그 mediaId → 2. 블로그 사진 추천 → 3. 스톡 이미지
+     순서로 대체)가 이미 실제 블로그 사진을 우선하도록 되어 있는 것을 확인했고, 위 1번
+     오디오 관련 방어 수정으로 인해 이 우선순위가 절대 깨지지 않도록 재확인했습니다.
+
+7. **내보내기 개편** (`components/AppRoot.tsx`, `package.json`)
+   - "텍스트 스크립트" 라벨을 "스크립트"로 변경.
+   - `jszip`을 추가해 새 내보내기 형식 "이미지·영상 (ZIP)"을 만들었습니다 — 각 장면에
+     등록된 사진/영상 파일을 실제로 fetch해서 zip으로 묶어 내보냅니다(placeholder만 있는
+     빈 장면은 자동으로 건너뜀).
+   - "다운로드는 어디 저장할지 물어보고, 보통 바탕화면에 저장한다"는 요청에 맞춰
+     `saveExportFile()` 헬퍼를 추가 — `showSaveFilePicker({startIn:'desktop', ...})`를
+     지원하는 브라우저(Chrome/Edge)에서는 저장 위치를 직접 고르는 대화상자를 바탕화면에서
+     시작하도록 띄우고, 지원하지 않으면 기존 브라우저 다운로드로 자연스럽게 대체됩니다.
+     사용자가 취소하면 `ExportCancelledError`로 조용히 되돌아가고 오류 배너를 띄우지
+     않습니다.
+   - 이 저장 대화상자 하나로 저장이 끝나므로, 예전의 "다운로드 + 저장 폴더
+     (KWJMvideoAI_data/exports/)에도 중복 저장" 체크박스(`alsoSaveToFolder`,
+     `writeExportToSaveFolder`)를 완전히 제거했습니다(내보내기는 파일당 1번만 저장).
+   - MP4 내보내기도 서버가 만든 mp4/srt/txt를 fetch해 같은 방식으로 저장하도록 바꿨고,
+     mp4 저장을 취소하면 전체를 취소로 처리하지만 부가 파일(srt/txt)의 저장을 취소해도
+     이미 저장된 mp4는 유지되도록 구분했습니다.
+   - "참고용 경로 메모" 입력 필드를 완전히 삭제했습니다.
+
+이번 세션은 네트워크가 열려 있어 실제로 `yarn install && yarn build`까지 끝까지 실행해
+빌드 성공을 확인했습니다(`npm install`로 먼저 검증했다가, 이 프로젝트는 `yarn.lock` 기준
+`yarn`을 쓴다는 것을 뒤늦게 확인하고 `yarn install`/`yarn build`로 다시 검증). 새로 추가한
+`jszip` 의존성도 정상적으로 설치·번들링됩니다. 다만 실제 LM Studio 서버, 실제 브라우저의
+`showSaveFilePicker` 대화상자 동작, 실제 블로그 폴더의 오디오 파일 데이터로 하는 수동
+테스트는 이번 세션에서 하지 못했으므로, 실사용 중 이상이 있으면 알려주세요.
+
+## 2026-08-02 — 장면당 미디어 1개 강제(중복 등록 버그 수정) + 등록 버튼 통합 + 타임라인
+전체 AI 생성 + 재생시간 슬라이더 세밀화(0.1초 단위, 10초 상한, 영상 길이 고정) +
+장면 미리보기 화면비율/블러 배경 처리 + 헤더 "가져오기" 단순화(폴더 연결 = 프로젝트 자동 오픈)
+
+사용자 요청 6건을 반영했습니다. 수정 파일: `components/AppRoot.tsx`, `store/useStore.ts`,
+`lib/llm.ts`, `lib/subtitles.ts`. 아래 각 항목은 자세한 설계 근거를 섹션 4.5~4.7, 5.3에도
+"현재 진실"로 기록해두었으니, 다음에 관련 기능을 손볼 때는 이 changelog보다 그 섹션들을
+먼저 참고하세요(이 항목은 "무엇을 왜 언제 바꿨는지"의 역사 기록입니다).
+
+1. **장면당 사진/영상은 항상 1개만 — 타임라인 중복 등록 버그 수정** (`store/useStore.ts`)
+   — 섹션 4.6 참고.
+   - 원인: `applyImageToScene`가 `localVideoName`/`localVideoUrl`을, `applyLocalVideoToScene`가
+     `photoRef`/`localImageName`을 서로 지우지 않아서, 사진→영상(또는 그 반대) 순서로 적용하면
+     두 참조가 동시에 남아 있었습니다. 네 개 함수(`applyImageToScene`, `applyLocalVideoToScene`,
+     `uploadPhotoToScene`, `uploadVideoToScene`) 모두 반대쪽 필드를 항상 함께 지우도록 수정.
+   - `clearSceneMedia(id)` 신설 — 장면의 사진/영상 등록을 전부 해제(토글용).
+   - `applyBulkSceneContent(updates)` 신설 — 아래 3번(타임라인 전체 AI 생성) 적용 시 장면
+     여러 개를 한 번의 `set()`으로 갱신(자동저장/수정이력 1회만 발생).
+   - `getVideoDurationSeconds(url)` 신설 — 숨은 `<video>` 엘리먼트로 실제 영상 길이(초)를
+     읽어 `applyLocalVideoToScene`/`uploadVideoToScene`가 `scene.duration`을 그 값으로
+     고정하도록 함(10초 상한과 무관, 0.1초 단위 반올림).
+2. **"비슷한 이미지 추천" 패널 — 등록 취소 토글 + 등록 버튼 통합** (`components/AppRoot.tsx`
+   `RecommendPanel`)
+   - `handleApplyBlog`/`handleApplyProjectMedia`에 토글 로직 추가: 이미 적용된 항목(핀 고정
+     썸네일이든 AI 추천 4칸이든)을 다시 누르면 `clearSceneMedia`를 호출해 등록을 취소.
+   - "사진 등록"/"영상 등록" 버튼 2개 + 파일 입력 2개를 "등록" 버튼 1개 + `accept="image/*,video/*"`
+     입력 1개로 통합(`handleRegisterFile`도 `kind` 매개변수를 없애고 파일의 MIME 타입으로
+     자체 판별). `registerBusy` 상태도 `'photo'|'video'|null`에서 `boolean`으로 단순화.
+3. **왼쪽 타임라인 패널 상단 "텍스트 AI로 생성" 버튼** (`components/AppRoot.tsx`
+   `EditorInterface`, `lib/llm.ts`) — 섹션 5.3 참고.
+   - `lib/llm.ts`에 `regenerateAllScenesForTimeline({ scenes, settings })` 신설 — 등록된
+     사진/영상 파일명과 전후 장면 흐름을 한 번의 요청으로 함께 보내, 모든 장면의 제목·
+     나레이션·대사를 "하나의 영화/다큐멘터리처럼 이어지게" 새로 씁니다. 실패 시 기존 내용을
+     그대로 돌려주는 안전한 폴백 포함(장면이 비거나 사라지지 않음).
+   - `EditorInterface`에 버튼 + 로딩/결과 안내 문구 추가(`handleGenerateAllScenes`), 결과는
+     `applyBulkSceneContent`로 한 번에 반영.
+4. **재생시간 슬라이더 — 0.1초 단위, 10초 상한, 영상은 자동 고정** (`components/AppRoot.tsx`
+   `SceneEditor`, `lib/subtitles.ts`, `lib/llm.ts`) — 섹션 4.6 참고.
+   - 슬라이더 `min/max/step`을 `1~20`(정수)에서 `0.1~10`(0.1 단위)으로 변경. 라벨도
+     `scene.duration.toFixed(1)`로 소수점 첫째 자리까지 표시.
+   - 영상이 등록된 장면(`scene.localVideoUrl`)은 슬라이더를 `disabled`로 잠그고 "영상 길이에
+     고정" 안내문을 보여줌 — 실제 값은 위 1번의 `getVideoDurationSeconds`가 채워줌.
+   - `lib/subtitles.ts`의 `MAX_AUTO_SCENE_SECONDS`를 20→10으로, `lib/llm.ts`의 텍스트 전용
+     스토리보드 프롬프트 힌트("duration은 3~20")도 "3~10"으로 맞춰 AI 자동 생성값도 항상
+     슬라이더 범위 안에 들어오도록 통일.
+5. **장면 미리보기 화면비율(가로/세로 꽉 차게) + 여백 블러 배경** (`components/AppRoot.tsx`
+   `MediaFrame`, `SceneEditor`) — 섹션 4.7 참고.
+   - 새 `MediaFrame` 컴포넌트: 실제 컨텐츠는 `object-contain`으로 렌더링해 가로/세로 어느
+     쪽이든 잘리지 않고 항상 전체가 보이게 하고, 남는 여백은 같은 미디어의 첫 프레임을
+     캔버스로 캡처한 정지 이미지를 확대+블러 처리해 배경으로 채웁니다. `SceneEditor`의
+     기존 `object-cover` 미리보기(사진/영상 양쪽)를 이걸로 교체.
+   - 범위는 편집기 화면뿐이며 MP4 실제 렌더링에는 적용하지 않음(요청 범위 밖) — 섹션 10에
+     알려진 제약으로 명시.
+6. **헤더 "가져오기" 단순화 — 블로그 가져오기 전용 + 폴더 연결이 곧 프로젝트 열기**
+   (`components/AppRoot.tsx`, `store/useStore.ts`) — 섹션 4.5 참고.
+   - `ImportHubModal`(3카드 허브)과 `LoadModal`("불러오기" 모달) 컴포넌트를 완전히 삭제.
+     `ModalState` 타입에서도 `'import'`/`'load'`를 제거. 헤더의 "가져오기" 버튼은
+     이제 `setModal('blog-import')`를 직접 호출(라벨도 "블로그에서 가져오기"로 변경).
+   - `MediaLibraryModal`/`BlogImportModal`의 "허브로 돌아가기" `onBack` 연결을 제거(허브가
+     없어졌으므로). 두 모달 자체와 `SceneEditor`의 "미디어 라이브러리에서 변경" 딥링크는
+     그대로 유지.
+   - `attachSaveDir`(폴더 연결)이 그 폴더에 저장된 장면(`app_state.json`)이 없으면(완전히
+     새 폴더) 메모리의 이전 장면/채팅/수정이력을 명시적으로 빈 상태로 초기화하고, 그 자리에서
+     바로 `saveAllToFolder({silent:true})`를 호출해 빈 데이터 파일들을 실제로 생성해둡니다
+     ("폴더에 데이터가 없으면 빈 데이터를 다시 생성해야 한다"는 요구사항). 저장된 장면이
+     있으면 예전처럼 그대로 복원합니다 — 즉 "폴더 연결" 자체가 "그 폴더의 프로젝트 열기"
+     역할을 대신합니다.
+   - `pickDirectory`/`listJsonFiles`/`readJsonFile`(`lib/fsAccess.ts`) import는 `LoadModal`
+     삭제로 더 이상 쓰이지 않아 `AppRoot.tsx`에서 제거(라이브러리 함수 자체는 그대로 남아있음
+     — 다른 곳에서 필요하면 재사용 가능).
+
+**검증**: 네트워크가 열려 있어 `npm install` → `npx tsc --noEmit`(오류 없음) →
+`next build`(정상 컴파일 + 정적 페이지 생성 성공)까지 전부 실행해 확인했습니다. 다만 다음은
+실기기 수동 확인이 필요합니다: ① 실제 LM Studio에 연결한 상태에서 "텍스트 AI로 생성" 버튼의
+실제 응답 품질(전후 문맥이 자연스러운지), ② 세로/가로 각각 다른 화면비율의 실제 사진·영상으로
+`MediaFrame`의 블러 배경이 시각적으로 자연스러운지, ③ 실제 영상 파일 여러 개로 영상 길이 자동
+고정이 다양한 코덱/컨테이너에서도 잘 동작하는지, ④ 완전히 빈 폴더를 새로 연결했을 때 빈 데이터
+파일이 실제로 생성되는지.
+
+## 2026-08-02(2) — "새 폴더 다시 연결 → 브라우저 강제종료" 버그 수정 + agent.md/README.md 정리
+
+**사용자 보고**: 저장 폴더 연결을 해제한 뒤 "새 폴더"로 다시 연결하려 하면 웹사이트(탭/브라우저)가
+갑자기 닫혔고, 브라우저를 다시 열어 연결을 시도해도 같은 문제가 반복됨.
+
+수정 파일: `store/useStore.ts`, `components/AppRoot.tsx`, `agent.md`, `README.md`. 자세한 설계
+근거는 섹션 4.8에 "현재 진실"로 기록해두었으니, 다음에 이 영역을 손볼 때는 이 changelog보다
+그 섹션을 먼저 참고하세요.
+
+1. **원인 특정 + 수정**(`store/useStore.ts`, `components/AppRoot.tsx`) — 섹션 4.8 참고.
+   - `disconnectSaveFolder()`가 IndexedDB에 남아있는 "기억해둔 폴더" 참조는 지우지 않고 메모리
+     상태만 지우고 있었음 → `forgetRememberedDirectoryHandle(REMEMBERED_SAVE_DIR_KEY)` 호출과
+     `rememberedSaveDirName: null` 초기화를 추가.
+   - 기억된 폴더로 자동 재연결(`initStorage()`) 도중 비정상 종료되면 다음 실행 때도 같은 폴더로
+     계속 재시도하던 문제 → `localStorage`에 재연결 진행 플래그(`RECONNECT_IN_PROGRESS_KEY`)를
+     추가해, 다음 실행 시 플래그가 남아있으면(=지난번 미완료) 자동 재연결을 건너뛰고 기억해둔
+     폴더도 함께 지우도록 함.
+   - `FolderConnectGate`, `SaveFolderOfflineBanner`에 "다른(새) 폴더 선택하기" 버튼을 추가해,
+     문제 있는 폴더에 갇히지 않고 언제든 탈출할 수 있게 함.
+2. **agent.md 정리**(agent.md 자체)
+   - 섹션 4.3이 이미 2026-07-27(2)에 제거된 "미디어 폴더 별도 연결" 개념을 여전히 현재
+     설계인 것처럼 설명하고 있어 실제 코드(`projects/<프로젝트명>/media/`에 실제 파일 복사)
+     기준으로 재작성.
+   - 섹션 4.2의 폴더 트리에 이미 삭제된 `exports/`가 남아있어 제거하고, 실제 존재하는
+     `projects/<이름>/media/`, `media_analysis.json`을 반영.
+   - 5.3과 7 사이에 있던 블로그 데이터 연동 설명 블록에 섹션 헤더 자체가 없어서 번호가
+     "5.3 → (헤더 없음) → 7"로 어긋나 있던 것을 발견 → `## 6. 블로그 데이터 연동` 헤더 추가.
+   - 이번 버그 수정의 설계 근거를 담은 섹션 4.8 신설.
+3. **README.md 정리**(README.md 자체)
+   - "미디어 폴더 연결"(별도 폴더 연결 개념, 이미 제거됨) 언급을 실제 동작(저장 폴더 안
+     `media/`에 업로드)으로 수정.
+   - 이미 없어진 "저장된 프로젝트 불러오기" UI 언급 제거.
+   - 내보내기 형식 목록에 빠져있던 "이미지·영상(ZIP)"을 추가.
+
+**검증**: `npm install` → `npx tsc --noEmit`(오류 없음) → `next build`(정상 컴파일 + 정적 페이지
+생성 성공)까지 실행해 확인했습니다. 다만 다음은 실기기 수동 확인이 필요합니다: ① 실제 크롬/엣지
+브라우저에서 "저장 폴더 연결 해제 → 새 폴더로 재연결"을 반복해도 더 이상 강제종료가 재현되지
+않는지, ② 기억된 폴더가 이미 손상/삭제된 상태에서 앱을 새로 열었을 때 자동으로 OPFS로 대체되고
+문제없이 "새 폴더 선택"으로 이어지는지.
+
 
 
 

@@ -5,12 +5,6 @@ import { useStore, sanitizeScenesForSave } from '@/store/useStore';
 import type { Scene, Project, LlmMode, MediaAnalysisEntry } from '@/store/useStore';
 import {
   isFileSystemAccessSupported,
-  pickDirectory,
-  listJsonFiles,
-  readJsonFile,
-  getDataDir,
-  getOrCreateSubDirectory,
-  writeTextFile,
   listMediaFiles,
   fileHandleToObjectUrl,
   type MediaFileEntry,
@@ -32,6 +26,7 @@ import {
   generateStoryboardFromMedia,
   generateStoryboardFromPosts,
   regenerateSceneNarration,
+  regenerateAllScenesForTimeline,
   CHAT_SYSTEM_PROMPT,
   buildBlogContextText,
   type MediaDescriptor,
@@ -58,7 +53,7 @@ import {
   Clapperboard,
   Sparkles,
   Clock,
-  Tag,
+  RotateCcw,
   X,
   Check,
   Folder,
@@ -201,7 +196,11 @@ async function resolveScenesWithBlogMedia(
     let sourcePostId: string | undefined;
 
     if (mediaId && blogDirHandle) {
-      const item = blogMedia.find((m) => m.id === mediaId);
+      // 2026-08-01: 오디오 항목은 장면의 사진/영상 자리에 쓸 수 없으므로(재생 미리보기가
+      // 아니라 <img>/<video>로 렌더링될 자리이기 때문), 여기서도 한 번 더 걸러냅니다 —
+      // lib/llm.ts의 validMediaIds 검증을 통과했더라도 안전하게 무시하고 2단계(블로그 사진
+      // 추천) 또는 3단계(스톡 이미지)로 자연스럽게 넘어갑니다.
+      const item = blogMedia.find((m) => m.id === mediaId && m.type !== 'audio');
       if (item) {
         try {
           const url = await blogMediaPreviewUrl(blogDirHandle, item);
@@ -278,7 +277,10 @@ function genId(prefix: string): string {
 // ─── Main App ─────────────────────────────────────────────────────────────────
 
 export default function AppRoot() {
-  const { view, setView, modal, setModal, darkMode, setDarkMode, initStorage, saveDirSource, saveDirHandle } = useStore();
+  const { view, setView, modal, setModal, darkMode, setDarkMode, initStorage, saveDirSource, saveDirHandle, resetChatHistory } = useStore();
+  // 2026-08-01: 헤더의 "채팅기록 초기화" 버튼용 인라인 확인 상태 — 실수로 채팅 기록을
+  // 날리지 않도록, 누르면 바로 지우지 않고 "확정/취소"를 한 번 더 보여줍니다.
+  const [confirmResetChat, setConfirmResetChat] = useState(false);
   // 2026-07-27(4): "폴더 지정 안 되어있으면 스토리보드 편집기 화면이 안 보여야 한다"는
   // 요청 — 실제 사용자 폴더(saveDirSource === 'external')가 연결되기 전에는 편집기 화면을
   // 잠금 안내 화면으로 대체합니다. 연결되는 즉시(store가 반응형이므로 새로고침 없이) 채팅
@@ -353,9 +355,9 @@ export default function AppRoot() {
               darkMode={darkMode}
             />
             <HeaderNavBtn
-              icon={<Upload className="w-3.5 h-3.5" />}
-              label="가져오기"
-              onClick={() => setModal('import')}
+              icon={<Newspaper className="w-3.5 h-3.5" />}
+              label="블로그에서 가져오기"
+              onClick={() => setModal('blog-import')}
               darkMode={darkMode}
             />
             <HeaderNavBtn
@@ -368,6 +370,46 @@ export default function AppRoot() {
         </div>
 
         <div className="flex items-center gap-3">
+          {/* 2026-08-01: 헤더의 채팅 탭에서만 보이는 "채팅기록 초기화" 버튼 — 채팅을
+              처음부터 다시 시작해서 새 스토리보드 내용을 만들 때 씁니다. */}
+          {view === 'chat' &&
+            (confirmResetChat ? (
+              <div className="flex items-center gap-1 shrink-0">
+                <span className={cn('text-[11px]', darkMode ? 'text-neutral-400' : 'text-neutral-500')}>초기화할까요?</span>
+                <button
+                  onClick={() => {
+                    resetChatHistory();
+                    setConfirmResetChat(false);
+                  }}
+                  className="px-2 py-1 rounded-md bg-rose-600 text-white hover:bg-rose-700 text-[11px] font-semibold"
+                >
+                  확정
+                </button>
+                <button
+                  onClick={() => setConfirmResetChat(false)}
+                  className={cn(
+                    'px-2 py-1 rounded-md text-[11px]',
+                    darkMode ? 'text-neutral-400 hover:bg-neutral-800' : 'text-neutral-500 hover:bg-neutral-100'
+                  )}
+                >
+                  취소
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={() => setConfirmResetChat(true)}
+                title="채팅기록을 초기화하고 새로 채팅을 시작합니다"
+                className={cn(
+                  'flex items-center gap-1.5 text-[11px] px-2.5 py-1.5 rounded-lg border font-medium transition-colors shrink-0',
+                  darkMode
+                    ? 'border-neutral-700 text-neutral-400 hover:border-rose-500/50 hover:text-rose-400'
+                    : 'border-neutral-200 text-neutral-500 hover:border-rose-300 hover:text-rose-500'
+                )}
+              >
+                <RotateCcw className="w-3 h-3" /> 채팅기록 초기화
+              </button>
+            ))}
+
           <LlmStatusBadge darkMode={darkMode} onClick={() => setModal('settings')} />
 
           {/* 설정 */}
@@ -403,6 +445,9 @@ export default function AppRoot() {
       {/* ── AI(LM Studio) 연결 안내 배너 ──────────────────────────────────── */}
       <LlmOfflineBanner darkMode={darkMode} onOpenSettings={() => setModal('settings')} />
 
+      {/* ── 저장 폴더 연결 끊김 안내 배너 ─────────────────────────────────── */}
+      <SaveFolderOfflineBanner darkMode={darkMode} />
+
       {/* ── Main ───────────────────────────────────────────────────────────── */}
       <main className="flex-1 min-h-0 overflow-hidden flex">
         <AnimatePresence mode="wait">
@@ -437,27 +482,17 @@ export default function AppRoot() {
         {modal === 'new-project' && (
           <NewProjectModal darkMode={darkMode} onClose={() => setModal(null)} />
         )}
-        {modal === 'import' && (
-          <ImportHubModal
-            darkMode={darkMode}
-            onClose={() => setModal(null)}
-            onPick={(target) => setModal(target)}
-          />
-        )}
-        {modal === 'load' && (
-          <LoadModal darkMode={darkMode} onClose={() => setModal(null)} onBack={() => setModal('import')} />
-        )}
         {modal === 'export' && (
           <ExportModal darkMode={darkMode} onClose={() => setModal(null)} />
         )}
         {modal === 'media' && (
-          <MediaLibraryModal darkMode={darkMode} onClose={() => setModal(null)} onBack={() => setModal('import')} />
+          <MediaLibraryModal darkMode={darkMode} onClose={() => setModal(null)} />
         )}
         {modal === 'settings' && (
           <SettingsModal darkMode={darkMode} onClose={() => setModal(null)} />
         )}
         {modal === 'blog-import' && (
-          <BlogImportModal darkMode={darkMode} onClose={() => setModal(null)} onBack={() => setModal('import')} />
+          <BlogImportModal darkMode={darkMode} onClose={() => setModal(null)} />
         )}
       </AnimatePresence>
     </div>
@@ -575,6 +610,108 @@ function LlmOfflineBanner({ darkMode, onOpenSettings }: { darkMode: boolean; onO
         <button
           onClick={() => setDismissed(true)}
           className={cn('w-6 h-6 flex items-center justify-center rounded-lg', darkMode ? 'hover:bg-rose-500/20' : 'hover:bg-rose-100')}
+          title="닫기"
+        >
+          <X className="w-3.5 h-3.5" />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── 저장 폴더 연결 끊김 안내 배너 ──────────────────────────────────────────────
+// 2026-08-01: saveAllToFolder가 계속 실패하면(폴더 연결이 중간에 끊긴 경우 등) 작은
+// 상태 텍스트만으로는 놓치기 쉬워, LlmOfflineBanner와 같은 방식으로 눈에 띄게
+// 알리고 "다시 연결" 버튼을 제공합니다. 백그라운드에서는 store가 8초마다 자동으로
+// 재시도하고 있으므로, 이 배너는 자동 복구가 안 될 때를 위한 보조 수단입니다.
+function SaveFolderOfflineBanner({ darkMode }: { darkMode: boolean }) {
+  const {
+    saveDirSource,
+    saveDirName,
+    saveStatus,
+    saveError,
+    rememberedSaveDirName,
+    reconnectRememberedSaveFolder,
+    connectSaveFolder,
+    disconnectSaveFolder,
+  } = useStore();
+  const [dismissed, setDismissed] = useState(false);
+  const [busy, setBusy] = useState<'reconnect' | 'new' | null>(null);
+  const prevStatus = useRef(saveStatus);
+
+  useEffect(() => {
+    if (prevStatus.current !== 'error' && saveStatus === 'error') setDismissed(false);
+    if (saveStatus !== 'error') setDismissed(false);
+    prevStatus.current = saveStatus;
+  }, [saveStatus]);
+
+  // external(실제 사용자 폴더) 저장이 실패할 때만 보여줍니다 — OPFS(브라우저 내부
+  // 자동 저장소)는 사용자가 신경 쓸 필요 없는 내부 구현이라 대상에서 제외합니다.
+  if (saveDirSource !== 'external' || saveStatus !== 'error' || dismissed) return null;
+
+  const handleReconnect = async () => {
+    setBusy('reconnect');
+    try {
+      if (rememberedSaveDirName) await reconnectRememberedSaveFolder();
+      else await connectSaveFolder();
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  // 2026-08-02(2): 기억해둔 폴더 자체가 문제(이동/삭제/손상)라 재연결이 계속 실패하는
+  // 경우를 위한 탈출구입니다. FolderConnectGate의 "다른(새) 폴더 선택하기"와 동일한
+  // 패턴 — 먼저 연결 해제로 기억해둔 참조를 지운 뒤 새 폴더 선택 창을 엽니다.
+  const handlePickNewFolder = async () => {
+    setBusy('new');
+    try {
+      disconnectSaveFolder();
+      await connectSaveFolder();
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <div
+      className={cn(
+        'shrink-0 flex items-center justify-between gap-3 px-5 py-2 text-xs border-b',
+        darkMode ? 'bg-amber-500/10 border-amber-500/20 text-amber-300' : 'bg-amber-50 border-amber-200 text-amber-700'
+      )}
+    >
+      <div className="flex items-center gap-2 min-w-0">
+        <AlertCircle className="w-4 h-4 shrink-0" />
+        <span className="truncate">
+          저장 폴더("{saveDirName}") 연결이 끊긴 것 같습니다 — {saveError ?? '임시저장이 실패하고 있습니다.'} 계속 자동으로 재시도하고 있지만, 계속되면 아래 버튼으로 다시 연결해주세요.
+        </span>
+      </div>
+      <div className="flex items-center gap-2 shrink-0">
+        <button
+          onClick={handleReconnect}
+          disabled={busy !== null}
+          className="px-2.5 py-1 rounded-lg bg-amber-600 text-white font-medium hover:bg-amber-700 transition-colors disabled:opacity-60"
+        >
+          {busy === 'reconnect' ? '연결하는 중...' : '다시 연결'}
+        </button>
+        <button
+          onClick={handlePickNewFolder}
+          disabled={busy !== null}
+          title="이전에 연결했던 폴더 기억을 지우고 완전히 새 폴더를 고릅니다"
+          className={cn(
+            'flex items-center gap-1 px-2.5 py-1 rounded-lg border font-medium transition-colors disabled:opacity-60',
+            darkMode ? 'border-amber-500/30 hover:bg-amber-500/10' : 'border-amber-300 hover:bg-amber-100'
+          )}
+        >
+          <FolderPlus className="w-3.5 h-3.5" />
+          {busy === 'new' ? '연결하는 중...' : '다른(새) 폴더 선택'}
+        </button>
+        <button
+          onClick={() => setDismissed(true)}
+          className={cn('w-6 h-6 flex items-center justify-center rounded-lg', darkMode ? 'hover:bg-amber-500/20' : 'hover:bg-amber-100')}
           title="닫기"
         >
           <X className="w-3.5 h-3.5" />
@@ -1272,12 +1409,12 @@ function FolderConnectGate({
   title: string;
   description: string;
 }) {
-  const { rememberedSaveDirName, connectSaveFolder, reconnectRememberedSaveFolder } = useStore();
-  const [busy, setBusy] = useState(false);
+  const { rememberedSaveDirName, connectSaveFolder, reconnectRememberedSaveFolder, disconnectSaveFolder } = useStore();
+  const [busy, setBusy] = useState<'reconnect' | 'new' | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
-  const handleConnect = async () => {
-    setBusy(true);
+  const handleReconnect = async () => {
+    setBusy('reconnect');
     setNotice(null);
     try {
       const res = rememberedSaveDirName ? await reconnectRememberedSaveFolder() : await connectSaveFolder();
@@ -1286,7 +1423,26 @@ function FolderConnectGate({
       console.error(err);
       setNotice('폴더를 연결하는 중 예기치 못한 오류가 발생했습니다.');
     } finally {
-      setBusy(false);
+      setBusy(null);
+    }
+  };
+
+  // 2026-08-02(2): 기억해둔 폴더가 이동/삭제/손상된 상태라 재연결이 계속 실패하는 경우,
+  // 사용자가 그 폴더에 갇히지 않고 언제든 완전히 새 폴더를 고를 수 있도록 하는 별도
+  // 진입점입니다. 먼저 disconnectSaveFolder()로 기억해둔 참조를 완전히 지운 뒤 폴더
+  // 선택 창을 엽니다.
+  const handlePickNewFolder = async () => {
+    setBusy('new');
+    setNotice(null);
+    try {
+      disconnectSaveFolder();
+      const res = await connectSaveFolder();
+      if (!res.ok && res.message) setNotice(res.message);
+    } catch (err) {
+      console.error(err);
+      setNotice('폴더를 연결하는 중 예기치 못한 오류가 발생했습니다.');
+    } finally {
+      setBusy(null);
     }
   };
 
@@ -1297,14 +1453,30 @@ function FolderConnectGate({
       </div>
       <p className="text-base font-semibold">{title}</p>
       <p className={cn('text-sm max-w-md leading-relaxed', darkMode ? 'text-neutral-400' : 'text-neutral-500')}>{description}</p>
-      <button
-        onClick={handleConnect}
-        disabled={busy}
-        className="mt-1 flex items-center gap-1.5 font-medium px-4 py-2 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50 transition-colors"
-      >
-        {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Link2 className="w-4 h-4" />}
-        {rememberedSaveDirName ? '이전 저장 폴더 다시 연결' : '저장 폴더 연결하기'}
-      </button>
+      <div className="mt-1 flex items-center gap-2">
+        <button
+          onClick={handleReconnect}
+          disabled={busy !== null}
+          className="flex items-center gap-1.5 font-medium px-4 py-2 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50 transition-colors"
+        >
+          {busy === 'reconnect' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Link2 className="w-4 h-4" />}
+          {rememberedSaveDirName ? '이전 저장 폴더 다시 연결' : '저장 폴더 연결하기'}
+        </button>
+        {rememberedSaveDirName && (
+          <button
+            onClick={handlePickNewFolder}
+            disabled={busy !== null}
+            title="이전에 연결했던 폴더 기억을 지우고 완전히 새 폴더를 고릅니다"
+            className={cn(
+              'flex items-center gap-1.5 font-medium px-4 py-2 rounded-lg border transition-colors disabled:opacity-50',
+              darkMode ? 'border-neutral-700 text-neutral-300 hover:bg-neutral-800' : 'border-neutral-300 text-neutral-600 hover:bg-neutral-100'
+            )}
+          >
+            {busy === 'new' ? <Loader2 className="w-4 h-4 animate-spin" /> : <FolderPlus className="w-4 h-4" />}
+            다른(새) 폴더 선택하기
+          </button>
+        )}
+      </div>
       {notice && <p className="text-xs text-rose-500 max-w-sm">{notice}</p>}
     </div>
   );
@@ -1319,8 +1491,45 @@ function EditorInterface({ darkMode, hasRealFolder }: { darkMode: boolean; hasRe
     deleteScene,
     addScene,
     currentProject,
+    applyBulkSceneContent,
+    llmBaseUrl,
+    llmModel,
+    llmMode,
+    llmStatus,
   } = useStore();
   const selectedScene = scenes.find((s) => s.id === selectedSceneId) ?? scenes[0] ?? null;
+
+  // 2026-08-02 추가: 타임라인 패널 상단 "텍스트 AI로 생성" 버튼 — 모든 장면의 제목/
+  // 나레이션/대사를 등록된 사진·영상 파일명과 앞뒤 장면 흐름을 참고해 한 번에 새로
+  // 작성합니다(하나의 영화·다큐멘터리처럼 자연스럽게 이어지도록). 장면별로 따로
+  // 요청하면 앞뒤 문맥이 끊기므로 lib/llm.ts의 regenerateAllScenesForTimeline이 전체
+  // 장면 목록을 한 번의 요청으로 함께 보냅니다.
+  const [aiAllBusy, setAiAllBusy] = useState(false);
+  const [aiAllNotice, setAiAllNotice] = useState<{ tone: 'info' | 'error'; text: string } | null>(null);
+
+  const handleGenerateAllScenes = async () => {
+    if (aiAllBusy || scenes.length === 0) return;
+    if (llmStatus === 'offline') {
+      setAiAllNotice({ tone: 'error', text: 'AI(LM Studio)가 연결되어 있지 않습니다. 헤더의 "설정"에서 먼저 연결해주세요.' });
+      setTimeout(() => setAiAllNotice(null), 4500);
+      return;
+    }
+    setAiAllBusy(true);
+    setAiAllNotice(null);
+    try {
+      const results = await regenerateAllScenesForTimeline({
+        scenes,
+        settings: { baseUrl: llmBaseUrl, model: llmModel, mode: llmMode },
+      });
+      applyBulkSceneContent(results);
+      setAiAllNotice({ tone: 'info', text: `장면 ${results.length}개의 제목·나레이션·대사를 새로 작성했습니다.` });
+    } catch (err: any) {
+      setAiAllNotice({ tone: 'error', text: err?.message || 'AI 생성 중 문제가 발생했습니다.' });
+    } finally {
+      setAiAllBusy(false);
+      setTimeout(() => setAiAllNotice(null), 5500);
+    }
+  };
 
   // 2026-07-27(4): 실제 저장 폴더가 연결되어 있지 않으면 스토리보드 편집기 화면 자체를
   // 보여주지 않고, 폴더를 연결하라는 잠금 화면으로 대체합니다. store가 반응형이라 폴더
@@ -1363,6 +1572,38 @@ function EditorInterface({ darkMode, hasRealFolder }: { darkMode: boolean; hasRe
           >
             {scenes.length}장면
           </span>
+        </div>
+
+        {/* 2026-08-02 추가: 타임라인 전체 AI 생성 버튼 — 등록된 사진/영상과 앞뒤 장면
+            흐름을 참고해 모든 장면의 제목/나레이션/대사를 한 번에 새로 작성합니다. */}
+        <div
+          className={cn(
+            'px-3 pt-3 pb-2 border-b',
+            darkMode ? 'border-neutral-800' : 'border-neutral-200'
+          )}
+        >
+          <button
+            onClick={handleGenerateAllScenes}
+            disabled={aiAllBusy || scenes.length === 0}
+            title="등록된 사진/영상과 앞뒤 장면을 참고해 모든 장면의 제목·나레이션·대사를 AI로 한 번에 생성합니다"
+            className={cn(
+              'w-full flex items-center justify-center gap-1.5 py-2 rounded-lg text-xs font-semibold transition-colors disabled:opacity-50 disabled:cursor-not-allowed',
+              'bg-indigo-500 hover:bg-indigo-600 text-white'
+            )}
+          >
+            {aiAllBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Wand2 className="w-3.5 h-3.5" />}
+            {aiAllBusy ? 'AI가 전체 장면을 작성하는 중...' : '텍스트 AI로 생성'}
+          </button>
+          {aiAllNotice && (
+            <p
+              className={cn(
+                'mt-1.5 text-[11px] leading-relaxed',
+                aiAllNotice.tone === 'error' ? 'text-rose-500' : darkMode ? 'text-neutral-400' : 'text-neutral-500'
+              )}
+            >
+              {aiAllNotice.text}
+            </p>
+          )}
         </div>
 
         {/* Project label */}
@@ -1577,12 +1818,117 @@ function SceneCard({
   );
 }
 
+// ─── MediaFrame (2026-08-02 추가) ─────────────────────────────────────────────
+//
+// 요청사항: "가로 사진/영상은 가로가 꽉 차게, 세로 사진/영상은 세로가 꽉 차게 해서 내용이
+// 전부 보이게 하고, 빈 공간(레터박스/필러박스)은 첫 프레임을 스크린샷 찍어 흐리게 채운다."
+//
+// object-contain은 원본 가로세로 비율을 유지한 채 부모 영역 안에 맞추므로, 가로로 넓은
+// 미디어는 자동으로 가로가 꽉 차고(위아래에 여백), 세로로 긴 미디어는 세로가 꽉 차게
+// (좌우에 여백) 배치되어 잘리는 부분 없이 항상 전체 내용이 보입니다. 그 여백을 검은
+// 배경 그대로 두는 대신, 같은 미디어의 첫 프레임을 캔버스로 캡처해 확대·블러 처리한
+// 것을 배경으로 깔아 빈 공간이 어색하지 않도록 합니다.
+//
+// 스토리보드 편집기의 장면 미리보기(SceneEditor)에 사용됩니다.
+function MediaFrame({
+  kind,
+  src,
+  alt,
+  videoControls = true,
+  overlay,
+}: {
+  kind: 'image' | 'video';
+  src: string;
+  alt?: string;
+  videoControls?: boolean;
+  overlay?: React.ReactNode;
+}) {
+  const [posterUrl, setPosterUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    setPosterUrl(null);
+    if (!src) return;
+
+    if (kind === 'image') {
+      // 사진은 그 자체가 "첫 프레임"이므로 바로 블러 배경으로 씁니다.
+      setPosterUrl(src);
+      return;
+    }
+
+    // 영상: 첫 프레임을 캔버스에 그려 정지 이미지(스크린샷)로 캡처합니다. 실제로
+    // 재생되는 <video>와는 별개인, 배경 전용 숨은 <video> 엘리먼트를 하나 더 만들어
+    // 사용합니다(재생 중인 미리보기 영상과 간섭하지 않도록).
+    let cancelled = false;
+    const probeEl = document.createElement('video');
+    probeEl.muted = true;
+    probeEl.playsInline = true;
+    probeEl.preload = 'auto';
+    probeEl.src = src;
+
+    const capture = () => {
+      if (cancelled) return;
+      try {
+        const canvas = document.createElement('canvas');
+        canvas.width = probeEl.videoWidth || 640;
+        canvas.height = probeEl.videoHeight || 360;
+        const ctx = canvas.getContext('2d');
+        if (ctx && canvas.width > 0 && canvas.height > 0) {
+          ctx.drawImage(probeEl, 0, 0, canvas.width, canvas.height);
+          setPosterUrl(canvas.toDataURL('image/jpeg', 0.7));
+        }
+      } catch {
+        // 코덱/CORS 등으로 캡처에 실패하면 그냥 검은 배경을 씁니다(치명적이지 않음).
+      }
+    };
+    probeEl.onloadeddata = () => {
+      try {
+        probeEl.currentTime = 0.05;
+      } catch {
+        capture();
+      }
+    };
+    probeEl.onseeked = capture;
+    probeEl.onerror = () => {};
+
+    return () => {
+      cancelled = true;
+      probeEl.removeAttribute('src');
+    };
+  }, [kind, src]);
+
+  return (
+    <div className="w-full h-full relative">
+      {posterUrl ? (
+        <div
+          className="absolute inset-0 bg-center bg-cover scale-110 blur-2xl opacity-60"
+          style={{ backgroundImage: `url(${posterUrl})` }}
+          aria-hidden
+        />
+      ) : (
+        <div className="absolute inset-0 bg-neutral-950" aria-hidden />
+      )}
+      <div className="absolute inset-0 flex items-center justify-center">
+        {kind === 'video' ? (
+          <video src={src} controls={videoControls} className="max-w-full max-h-full object-contain bg-transparent" />
+        ) : (
+          <img src={src} alt={alt} className="max-w-full max-h-full object-contain" />
+        )}
+      </div>
+      {overlay}
+    </div>
+  );
+}
+
 // ─── Scene Editor (center) ────────────────────────────────────────────────────
 
 function SceneEditor({ scene, darkMode }: { scene: Scene; darkMode: boolean }) {
   const { scenes, updateScene, pushEditLog, setModal, llmBaseUrl, llmModel, llmMode } = useStore();
-  const [aiNotice, setAiNotice] = useState<{ tone: 'info' | 'error'; text: string } | null>(null);
-  const [aiBusy, setAiBusy] = useState(false);
+  // target을 함께 저장해, 결과 팝업이 어떤 필드(제목/나레이션/대사) 버튼 아래에 떠야 하는지
+  // 구분합니다.
+  const [aiNotice, setAiNotice] = useState<{ tone: 'info' | 'error'; text: string; target: 'title' | 'narration' | 'dialogue' } | null>(null);
+  // 2026-08-01: 장면 제목·나레이션·대사를 각각 독립적으로 AI 생성할 수 있도록, 어떤 항목을
+  // 생성 중인지를 저장합니다(boolean 대신 target을 저장해 버튼별로 로딩 상태를 구분).
+  const [aiBusyTarget, setAiBusyTarget] = useState<'title' | 'narration' | 'dialogue' | null>(null);
   const titleDraftRef = useRef(scene.customTitle);
   const narrationDraftRef = useRef(scene.narration);
   const dialogueDraftRef = useRef(scene.dialogue);
@@ -1604,28 +1950,80 @@ function SceneEditor({ scene, darkMode }: { scene: Scene; darkMode: boolean }) {
     }
   };
 
-  const handleAiRegenerate = async () => {
-    if (aiBusy) return;
-    setAiBusy(true);
+  /**
+   * 장면 제목/나레이션/대사 중 하나를 AI로 (다시) 생성합니다.
+   * 2026-08-01: 예전에는 나레이션 버튼 하나만 있었지만, 이제 세 항목 모두 독립적으로
+   * AI 생성이 가능합니다. 또한 실패했을 때 항상 "LM Studio에 연결하지 못했습니다"라는
+   * 고정 문구만 보여주던 문제를 고쳐, 실제 오류 메시지(err.message)를 그대로 보여줍니다 —
+   * LM Studio는 정상 연결되어 있는데 다른 이유(모델 응답 형식 오류 등)로 실패한 경우에도
+   * "연결 문제"로 오인하지 않도록 하기 위해서입니다.
+   */
+  const handleAiGenerate = async (target: 'title' | 'narration' | 'dialogue') => {
+    if (aiBusyTarget) return;
+    setAiBusyTarget(target);
     setAiNotice(null);
     try {
-      const { narration, dialogue } = await regenerateSceneNarration({
+      const result = await regenerateSceneNarration({
         scene,
         allScenes: scenes,
         settings: { baseUrl: llmBaseUrl, model: llmModel, mode: llmMode },
+        target,
       });
-      updateScene(scene.id, { narration, dialogue });
-      pushEditLog('scene_ai_regenerate', `"${scene.customTitle}" 장면 나레이션 AI 재생성`);
-      setAiNotice({ tone: 'info', text: '나레이션을 새로 만들었습니다.' });
+      if (target === 'title') {
+        updateScene(scene.id, { customTitle: result.customTitle });
+        pushEditLog('scene_ai_regenerate', `"${scene.customTitle}" 장면 제목 AI 생성 → "${result.customTitle}"`);
+        setAiNotice({ tone: 'info', text: '장면 제목을 새로 만들었습니다.', target });
+      } else if (target === 'dialogue') {
+        updateScene(scene.id, { dialogue: result.dialogue });
+        pushEditLog('scene_ai_regenerate', `"${scene.customTitle}" 장면 대사 AI 생성`);
+        setAiNotice({ tone: 'info', text: '대사를 새로 만들었습니다.', target });
+      } else {
+        updateScene(scene.id, { narration: result.narration });
+        pushEditLog('scene_ai_regenerate', `"${scene.customTitle}" 장면 나레이션 AI 생성`);
+        setAiNotice({ tone: 'info', text: '나레이션을 새로 만들었습니다.', target });
+      }
     } catch (err: any) {
       setAiNotice({
         tone: 'error',
-        text: 'LM Studio에 연결하지 못했습니다. 헤더의 "설정"에서 서버 주소/모델을 확인해주세요.',
+        text: err?.message || 'LM Studio에 연결하지 못했습니다. 헤더의 "설정"에서 서버 주소/모델을 확인해주세요.',
+        target,
       });
     } finally {
-      setAiBusy(false);
+      setAiBusyTarget(null);
       setTimeout(() => setAiNotice(null), 4000);
     }
+  };
+
+  // 제목/나레이션/대사 필드에서 공통으로 쓰는 "AI 생성" 버튼 + 결과 팝업입니다.
+  const renderAiFieldButton = (target: 'title' | 'narration' | 'dialogue', label: string) => {
+    const busy = aiBusyTarget === target;
+    return (
+      <div className="relative">
+        <button
+          type="button"
+          onClick={() => handleAiGenerate(target)}
+          disabled={!!aiBusyTarget}
+          className="flex items-center gap-1 text-xs text-indigo-500 hover:text-indigo-600 transition-colors disabled:opacity-50"
+        >
+          {busy ? <Loader2 className="w-3 h-3 animate-spin" /> : <Sparkles className="w-3 h-3" />}
+          {busy ? 'AI 생성 중...' : label}
+        </button>
+        {aiNotice && aiNotice.target === target && (
+          <div
+            className={cn(
+              'absolute right-0 top-6 z-10 w-56 text-[11px] leading-relaxed rounded-lg px-3 py-2 shadow-lg border',
+              aiNotice.tone === 'error'
+                ? 'border-rose-500/40 bg-rose-500/10 text-rose-500'
+                : darkMode
+                ? 'bg-neutral-800 border-neutral-700 text-neutral-300'
+                : 'bg-white border-neutral-200 text-neutral-600'
+            )}
+          >
+            {aiNotice.text}
+          </div>
+        )}
+      </div>
+    );
   };
 
   return (
@@ -1634,41 +2032,34 @@ function SceneEditor({ scene, darkMode }: { scene: Scene; darkMode: boolean }) {
       <div className="p-5">
         <div className="aspect-video w-full rounded-2xl overflow-hidden bg-neutral-900 relative shadow-lg">
           {scene.localVideoUrl ? (
-            <video
-              src={scene.localVideoUrl}
-              controls
-              className="w-full h-full object-cover bg-black"
-            />
+            <MediaFrame kind="video" src={scene.localVideoUrl} videoControls />
           ) : (
-            <>
-              <img
-                src={getSceneImageSrc(scene.photoRef)}
-                alt={scene.customTitle}
-                className="w-full h-full object-cover opacity-90"
-              />
-              <div className="absolute inset-0 bg-gradient-to-t from-black/70 via-black/10 to-transparent flex flex-col justify-end p-5 pointer-events-none">
-                <div className="flex items-center gap-2 mb-2">
-                  <span className="text-[10px] font-mono text-white/50 uppercase tracking-widest bg-white/10 px-2 py-0.5 rounded">
-                    장면 미리보기
-                  </span>
-                  {scene.tags?.map((tag) => (
-                    <span key={tag} className="text-[10px] text-white/60 bg-white/10 px-2 py-0.5 rounded font-mono">
-                      #{tag}
-                    </span>
-                  ))}
-                </div>
-                <p className="text-white text-sm leading-relaxed drop-shadow-md font-medium">{scene.narration}</p>
-                {scene.dialogue && (
-                  <p className="text-amber-300 text-xs mt-1.5 drop-shadow-md">"{scene.dialogue}"</p>
-                )}
-              </div>
-              {/* Play overlay */}
-              <div className="absolute inset-0 flex items-center justify-center opacity-0 hover:opacity-100 transition-opacity bg-black/20 pointer-events-none">
-                <div className="w-14 h-14 rounded-full bg-white/20 backdrop-blur-sm flex items-center justify-center">
-                  <Play className="w-6 h-6 text-white ml-1" />
-                </div>
-              </div>
-            </>
+            <MediaFrame
+              kind="image"
+              src={getSceneImageSrc(scene.photoRef)}
+              alt={scene.customTitle}
+              overlay={
+                <>
+                  <div className="absolute inset-0 bg-gradient-to-t from-black/70 via-black/10 to-transparent flex flex-col justify-end p-5 pointer-events-none">
+                    <div className="flex items-center gap-2 mb-2">
+                      <span className="text-[10px] font-mono text-white/50 uppercase tracking-widest bg-white/10 px-2 py-0.5 rounded">
+                        장면 미리보기
+                      </span>
+                    </div>
+                    <p className="text-white text-sm leading-relaxed drop-shadow-md font-medium">{scene.narration}</p>
+                    {scene.dialogue && (
+                      <p className="text-amber-300 text-xs mt-1.5 drop-shadow-md">"{scene.dialogue}"</p>
+                    )}
+                  </div>
+                  {/* Play overlay */}
+                  <div className="absolute inset-0 flex items-center justify-center opacity-0 hover:opacity-100 transition-opacity bg-black/20 pointer-events-none">
+                    <div className="w-14 h-14 rounded-full bg-white/20 backdrop-blur-sm flex items-center justify-center">
+                      <Play className="w-6 h-6 text-white ml-1" />
+                    </div>
+                  </div>
+                </>
+              }
+            />
           )}
         </div>
 
@@ -1712,6 +2103,7 @@ function SceneEditor({ scene, darkMode }: { scene: Scene; darkMode: boolean }) {
         <Field
           label="장면 제목"
           icon={<Clapperboard className="w-3.5 h-3.5 text-indigo-500" />}
+          action={renderAiFieldButton('title', 'AI 생성')}
         >
           <input
             type="text"
@@ -1731,32 +2123,7 @@ function SceneEditor({ scene, darkMode }: { scene: Scene; darkMode: boolean }) {
         <Field
           label="나레이션"
           icon={<FileText className="w-3.5 h-3.5 text-indigo-500" />}
-          action={
-            <div className="relative">
-              <button
-                onClick={handleAiRegenerate}
-                disabled={aiBusy}
-                className="flex items-center gap-1 text-xs text-indigo-500 hover:text-indigo-600 transition-colors disabled:opacity-50"
-              >
-                {aiBusy ? <Loader2 className="w-3 h-3 animate-spin" /> : <Sparkles className="w-3 h-3" />}
-                {aiBusy ? 'AI 재생성 중...' : 'AI 재생성'}
-              </button>
-              {aiNotice && (
-                <div
-                  className={cn(
-                    'absolute right-0 top-6 z-10 w-56 text-[11px] leading-relaxed rounded-lg px-3 py-2 shadow-lg border',
-                    aiNotice.tone === 'error'
-                      ? 'border-rose-500/40 bg-rose-500/10 text-rose-500'
-                      : darkMode
-                      ? 'bg-neutral-800 border-neutral-700 text-neutral-300'
-                      : 'bg-white border-neutral-200 text-neutral-600'
-                  )}
-                >
-                  {aiNotice.text}
-                </div>
-              )}
-            </div>
-          }
+          action={renderAiFieldButton('narration', 'AI 재생성')}
         >
           <textarea
             value={scene.narration}
@@ -1776,6 +2143,7 @@ function SceneEditor({ scene, darkMode }: { scene: Scene; darkMode: boolean }) {
         <Field
           label="대사"
           icon={<MessageSquare className="w-3.5 h-3.5 text-amber-500" />}
+          action={renderAiFieldButton('dialogue', 'AI 생성')}
         >
           <textarea
             value={scene.dialogue}
@@ -1791,50 +2159,35 @@ function SceneEditor({ scene, darkMode }: { scene: Scene; darkMode: boolean }) {
           />
         </Field>
 
-        {/* Duration */}
+        {/* Duration — 2026-08-02: 20초 상한을 10초로 줄이고, 0.1초 단위로 세밀하게 조절할
+            수 있도록 변경했습니다. 영상이 등록된 장면은 실제 영상 길이에 재생시간이 자동
+            고정되므로(제한 시간과 무관하게) 슬라이더를 잠그고 안내 문구를 보여줍니다. */}
         <Field
-          label={`재생 시간 — ${scene.duration}초`}
+          label={`재생 시간 — ${scene.duration.toFixed(1)}초${scene.localVideoUrl ? ' (영상 길이에 고정)' : ''}`}
           icon={<Clock className="w-3.5 h-3.5 text-emerald-500" />}
         >
           <input
             type="range"
-            min={1}
-            max={20}
+            min={0.1}
+            max={10}
+            step={0.1}
             value={scene.duration}
+            disabled={!!scene.localVideoUrl}
             onChange={(e) => updateScene(scene.id, { duration: Number(e.target.value) })}
             onMouseUp={(e) => logIfChanged(durationDraftRef, Number((e.target as HTMLInputElement).value), '재생시간')}
             onTouchEnd={(e) => logIfChanged(durationDraftRef, Number((e.target as HTMLInputElement).value), '재생시간')}
-            className="w-full accent-indigo-500"
+            className={cn('w-full accent-indigo-500', scene.localVideoUrl && 'opacity-50 cursor-not-allowed')}
           />
           <div className="flex justify-between text-xs text-neutral-400 mt-1">
-            <span>1초</span>
-            <span>20초</span>
+            <span>0.1초</span>
+            <span>10초</span>
           </div>
-        </Field>
-
-        {/* Tags */}
-        <Field
-          label="태그"
-          icon={<Tag className="w-3.5 h-3.5 text-rose-400" />}
-        >
-          <div className="flex flex-wrap gap-1.5">
-            {(scene.tags ?? []).map((tag) => (
-              <span
-                key={tag}
-                className={cn(
-                  'text-xs px-2.5 py-1 rounded-full border',
-                  darkMode
-                    ? 'border-neutral-700 bg-neutral-800 text-neutral-300'
-                    : 'border-neutral-200 bg-neutral-50 text-neutral-600'
-                )}
-              >
-                #{tag}
-              </span>
-            ))}
-            {(scene.tags ?? []).length === 0 && (
-              <span className="text-xs text-neutral-400">태그 없음</span>
-            )}
-          </div>
+          {scene.localVideoUrl && (
+            <p className={cn('mt-1.5 text-[11px] leading-relaxed', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>
+              영상이 등록된 장면은 재생시간이 실제 영상 길이({scene.duration.toFixed(1)}초)에 자동으로
+              맞춰지며(10초 제한과 무관), 사진으로 바꾸면 다시 직접 조절할 수 있습니다.
+            </p>
+          )}
         </Field>
       </div>
     </div>
@@ -1901,6 +2254,7 @@ function RecommendPanel({ scene, darkMode }: { scene: Scene; darkMode: boolean }
   const {
     applyImageToScene,
     applyLocalVideoToScene,
+    clearSceneMedia,
     updateScene,
     blogDirHandle,
     blogMedia,
@@ -1922,10 +2276,11 @@ function RecommendPanel({ scene, darkMode }: { scene: Scene; darkMode: boolean }
 
   // "이 장면 전용 등록" — scene.pinnedMediaPaths에 있는 파일들의 미리보기 URL.
   const [pinnedUrls, setPinnedUrls] = useState<Record<string, string>>({});
-  const [registerBusy, setRegisterBusy] = useState<'photo' | 'video' | null>(null);
+  // 2026-08-02: 사진 등록/영상 등록 버튼 2개를 "등록하기" 버튼 1개로 합쳤으므로(요청사항),
+  // busy 상태도 종류 구분 없이 boolean 하나면 충분합니다.
+  const [registerBusy, setRegisterBusy] = useState(false);
   const [registerNotice, setRegisterNotice] = useState<string | null>(null);
-  const photoInputRef = useRef<HTMLInputElement>(null);
-  const videoInputRef = useRef<HTMLInputElement>(null);
+  const registerInputRef = useRef<HTMLInputElement>(null);
   const mediaFilesRef = useRef<MediaFileEntry[]>([]);
 
   // 생성한 objectURL 중 실제로 장면에 적용된 것은 revoke하지 않도록 구분해서 관리합니다
@@ -2055,6 +2410,14 @@ function RecommendPanel({ scene, darkMode }: { scene: Scene; darkMode: boolean }
   };
 
   const handleApplyBlog = (item: BlogMediaMeta, url: string) => {
+    // 2026-08-02: "다시 한번 더 누르면 등록 취소" — 이미 적용된 항목을 또 누르면 장면의
+    // 사진/영상 등록을 해제합니다(토글).
+    const isCurrentlyApplied = appliedId === item.id || scene.sourceMediaId === item.id;
+    if (isCurrentlyApplied) {
+      clearSceneMedia(scene.id);
+      setAppliedId(null);
+      return;
+    }
     appliedUrlsRef.current.add(url);
     applyImageToScene(scene.id, url, {
       localImageName: blogMediaFileName(item.url),
@@ -2066,6 +2429,16 @@ function RecommendPanel({ scene, darkMode }: { scene: Scene; darkMode: boolean }
   };
 
   const handleApplyProjectMedia = async (entry: MediaAnalysisEntry, url: string) => {
+    // 2026-08-02: 위와 동일한 토글 규칙 — 이미 적용된 사진/영상을 다시 누르면 등록 취소.
+    // (사진이든 영상이든, 추천 이미지든 이 장면 전용 등록이든 한 장면에는 최종적으로
+    // 하나만 등록될 수 있어야 하므로, 새 항목을 누르면 store가 기존 것을 자동으로
+    // 대체합니다 — applyImageToScene/applyLocalVideoToScene 참고.)
+    const isCurrentlyApplied = appliedId === entry.path || scene.localImageName === entry.path || scene.localVideoName === entry.path;
+    if (isCurrentlyApplied) {
+      clearSceneMedia(scene.id);
+      setAppliedId(null);
+      return;
+    }
     appliedUrlsRef.current.add(url);
     const fileEntry = mediaFilesRef.current.find((f) => f.path === entry.path);
     if (!fileEntry) return;
@@ -2080,12 +2453,13 @@ function RecommendPanel({ scene, darkMode }: { scene: Scene; darkMode: boolean }
     setAppliedId(entry.path);
   };
 
-  // ── "사진 등록"/"영상 등록" — 새로고침 버튼 왼쪽에 위치, 이 장면 전용으로 고정됩니다 ──
-  const handleRegisterFile = async (file: File, kind: 'photo' | 'video') => {
-    setRegisterBusy(kind);
+  // ── "등록하기" — 새로고침 버튼 왼쪽에 위치, 사진/영상을 한 버튼으로 함께 받아서 이
+  //    장면 전용으로 고정합니다(2026-08-02: 기존에는 사진용/영상용 버튼이 각각 있었습니다) ──
+  const handleRegisterFile = async (file: File) => {
+    setRegisterBusy(true);
     setRegisterNotice(null);
     const res = await addFilesToProjectMedia([file]);
-    setRegisterBusy(null);
+    setRegisterBusy(false);
     if (!res.ok || !res.added || res.added.length === 0) {
       setRegisterNotice(res.message ?? '등록에 실패했습니다.');
       setTimeout(() => setRegisterNotice(null), 5000);
@@ -2121,48 +2495,26 @@ function RecommendPanel({ scene, darkMode }: { scene: Scene; darkMode: boolean }
         </div>
         <div className="flex items-center gap-1 shrink-0">
           <input
-            ref={photoInputRef}
+            ref={registerInputRef}
             type="file"
-            accept="image/*"
+            accept="image/*,video/*"
             className="hidden"
             onChange={(e) => {
               const file = e.target.files?.[0];
               e.target.value = '';
-              if (file) handleRegisterFile(file, 'photo');
-            }}
-          />
-          <input
-            ref={videoInputRef}
-            type="file"
-            accept="video/*"
-            className="hidden"
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              e.target.value = '';
-              if (file) handleRegisterFile(file, 'video');
+              if (file) handleRegisterFile(file);
             }}
           />
           <button
-            onClick={() => photoInputRef.current?.click()}
-            disabled={registerBusy !== null}
-            title="사진 등록 (이 장면 전용)"
+            onClick={() => registerInputRef.current?.click()}
+            disabled={registerBusy}
+            title="사진/영상 등록 (이 장면 전용)"
             className={cn(
               'w-7 h-7 flex items-center justify-center rounded-lg transition-colors disabled:opacity-50',
               darkMode ? 'hover:bg-neutral-800 text-neutral-400' : 'hover:bg-neutral-200 text-neutral-500'
             )}
           >
-            {registerBusy === 'photo' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ImageIcon className="w-3.5 h-3.5" />}
-          </button>
-          <button
-            onClick={() => videoInputRef.current?.click()}
-            disabled={registerBusy !== null}
-            title="영상 등록 (이 장면 전용)"
-            className={cn(
-              'w-7 h-7 flex items-center justify-center rounded-lg transition-colors disabled:opacity-50',
-              darkMode ? 'hover:bg-neutral-800 text-neutral-400' : 'hover:bg-neutral-200 text-neutral-500'
-            )}
-          >
-            {registerBusy === 'video' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Video className="w-3.5 h-3.5" />}
+            {registerBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <FolderPlus className="w-3.5 h-3.5" />}
           </button>
           <button
             onClick={handleRefresh}
@@ -2177,6 +2529,20 @@ function RecommendPanel({ scene, darkMode }: { scene: Scene; darkMode: boolean }
           </button>
         </div>
       </div>
+      {/* 2026-08-01: 영상에 넣을 이미지의 권장 크기를 px 단위로 안내합니다 — 화면 비율에 따라
+          가로/세로 영상 모두 화질 저하 없이 쓸 수 있는 최소 해상도 기준입니다. */}
+      <p
+        className={cn(
+          'px-4 pt-2 text-[11px] leading-relaxed flex items-start gap-1.5',
+          darkMode ? 'text-neutral-500' : 'text-neutral-400'
+        )}
+      >
+        <Info className="w-3 h-3 shrink-0 mt-0.5" />
+        <span>
+          영상에 쓸 이미지 권장 크기: 가로(16:9) <strong className={darkMode ? 'text-neutral-300' : 'text-neutral-600'}>1920×1080px</strong> ·
+          세로(9:16) <strong className={darkMode ? 'text-neutral-300' : 'text-neutral-600'}>1080×1920px</strong> 이상
+        </span>
+      </p>
       {registerNotice && (
         <p className={cn('px-4 pt-2 text-[11px] leading-relaxed', darkMode ? 'text-neutral-400' : 'text-neutral-500')}>
           {registerNotice}
@@ -2537,482 +2903,49 @@ function NewProjectModal({ darkMode, onClose }: { darkMode: boolean; onClose: ()
   );
 }
 
-// ─── 가져오기 허브 모달 (2026-07-27(3) 신설) ───────────────────────────────────
-//
-// 요청사항: "불러오기와 미디어라이브러리와 블로그에서 가져오기는 같은 버튼 하나로
-// 진행가능하게 하자." 헤더를 깔끔하게 유지하기 위해, 세 기능을 각각 별도 버튼으로
-// 두지 않고 이 허브 모달에서 카드 형태로 골라 들어가도록 통합했습니다. 각 기능이
-// 실제로 무엇을 필요로 하는지(저장 폴더 연결 여부 등)도 카드에 바로 보여줘서,
-// 들어가서야 "폴더를 연결하세요"를 보고 다시 나오는 일을 줄입니다.
-function ImportHubModal({
-  darkMode,
-  onClose,
-  onPick,
-}: {
-  darkMode: boolean;
-  onClose: () => void;
-  onPick: (target: 'load' | 'media' | 'blog-import') => void;
-}) {
-  const { saveDirHandle, saveDirName, saveDirSource, blogDirHandle, blogDirName } = useStore();
-  const hasRealFolder = saveDirSource === 'external' && !!saveDirHandle;
-  const modalBg = darkMode ? 'bg-neutral-900 border-neutral-800' : 'bg-white border-neutral-200';
-
-  const cards: {
-    target: 'load' | 'media' | 'blog-import';
-    icon: React.ReactNode;
-    title: string;
-    desc: string;
-    status: { ok: boolean; text: string };
-  }[] = [
-    {
-      target: 'load',
-      icon: <FolderOpen className="w-5 h-5 text-indigo-500" />,
-      title: '프로젝트 불러오기',
-      desc: '저장 폴더(또는 다른 폴더)에 저장해둔 프로젝트를 불러옵니다.',
-      status: hasRealFolder
-        ? { ok: true, text: `"${saveDirName}" 폴더의 프로젝트를 바로 불러올 수 있습니다` }
-        : { ok: true, text: '저장 폴더가 없어도 "다른 폴더에서 불러오기"로 바로 사용 가능' },
-    },
-    {
-      target: 'media',
-      icon: <ImageIcon className="w-5 h-5 text-emerald-500" />,
-      title: '미디어 라이브러리',
-      desc: '등록해둔 사진·영상을 골라 장면에 적용하거나, 새 파일을 등록합니다.',
-      status: hasRealFolder
-        ? { ok: true, text: '실제 저장 폴더가 연결되어 있어 바로 사용 가능' }
-        : { ok: false, text: '실제 저장 폴더를 먼저 연결해야 사용할 수 있습니다' },
-    },
-    {
-      target: 'blog-import',
-      icon: <Newspaper className="w-5 h-5 text-amber-500" />,
-      title: '블로그에서 가져오기',
-      desc: '블로그 데이터 폴더(posts.json 등)를 연결해 글을 스토리보드로 만듭니다.',
-      status: blogDirHandle
-        ? { ok: true, text: `"${blogDirName}" 폴더에 연결되어 있습니다` }
-        : { ok: true, text: '눌러서 블로그 데이터 폴더를 먼저 연결하세요' },
-    },
-  ];
-
-  return (
-    <ModalBackdrop onClose={onClose}>
-      <div className={cn('w-full max-w-xl rounded-2xl border shadow-2xl', modalBg)}>
-        <div className={cn('flex items-center justify-between px-6 py-4 border-b', darkMode ? 'border-neutral-800' : 'border-neutral-200')}>
-          <div className="flex items-center gap-2">
-            <Upload className="w-5 h-5 text-indigo-500" />
-            <h2 className="font-bold text-base">가져오기</h2>
-          </div>
-          <button onClick={onClose} className={cn('w-7 h-7 flex items-center justify-center rounded-lg', darkMode ? 'hover:bg-neutral-800' : 'hover:bg-neutral-100')}>
-            <X className="w-4 h-4" />
-          </button>
-        </div>
-        <div className="p-5 space-y-3">
-          {cards.map((c) => (
-            <button
-              key={c.target}
-              onClick={() => onPick(c.target)}
-              className={cn(
-                'w-full text-left flex items-start gap-3 p-4 rounded-xl border transition-colors',
-                darkMode
-                  ? 'border-neutral-800 hover:border-neutral-700 hover:bg-neutral-800/60'
-                  : 'border-neutral-200 hover:border-neutral-300 hover:bg-neutral-50'
-              )}
-            >
-              <div className="shrink-0 mt-0.5">{c.icon}</div>
-              <div className="min-w-0 flex-1">
-                <p className="font-semibold text-sm">{c.title}</p>
-                <p className={cn('text-xs mt-0.5', darkMode ? 'text-neutral-400' : 'text-neutral-500')}>{c.desc}</p>
-                <p className={cn('text-xs mt-1.5 flex items-center gap-1', c.status.ok ? 'text-emerald-500' : 'text-amber-500')}>
-                  {c.status.ok ? <Check className="w-3 h-3" /> : <AlertCircle className="w-3 h-3" />}
-                  {c.status.text}
-                </p>
-              </div>
-            </button>
-          ))}
-        </div>
-      </div>
-    </ModalBackdrop>
-  );
-}
-
-// ─── Load Modal ───────────────────────────────────────────────────────────────
-
-/** "다른 폴더에서 불러오기"용 JSON 파일 미리보기 — 파일명/원문 JSON을 그대로 보여주지 않고
- *  프로젝트 카드(썸네일/이름/장면 수/수정일)로 예쁘게 파싱해서 보여주기 위한 타입입니다. */
-interface FolderProjectPreview {
-  name: string;
-  handle: any;
-  title: string;
-  sceneCount: number | null;
-  modifiedAt: string | null;
-  thumbnail?: string;
-  valid: boolean;
-}
-
-function LoadModal({ darkMode, onClose, onBack }: { darkMode: boolean; onClose: () => void; onBack?: () => void }) {
-  const { saveDirHandle, saveDirName, listNamedProjects, loadNamedProject, deleteNamedProject, setCurrentProject, setView } = useStore();
-  const [fsSupported, setFsSupported] = useState(false);
-
-  // 연결된 저장 폴더의 projects/ 목록
-  const [namedProjects, setNamedProjects] = useState<{ name: string; handle: any; modifiedAt?: string; sceneCount?: number }[]>([]);
-  const [loadingList, setLoadingList] = useState(false);
-  const [loadingNamed, setLoadingNamed] = useState<string | null>(null);
-  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
-  const [deletingName, setDeletingName] = useState<string | null>(null);
-
-  // 임의 폴더에서 불러오기 (저장 폴더 연결 없이도 사용 가능한 보조 기능)
-  const [folderName, setFolderName] = useState<string | null>(null);
-  const [folderProjects, setFolderProjects] = useState<FolderProjectPreview[]>([]);
-  const [selectedFile, setSelectedFile] = useState<string | null>(null);
-  const [browsingFolder, setBrowsingFolder] = useState(false);
-  const [loadingFile, setLoadingFile] = useState(false);
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
-
-  useEffect(() => {
-    setFsSupported(isFileSystemAccessSupported());
-  }, []);
-
-  const refreshNamedProjects = () => {
-    if (!saveDirHandle) {
-      setNamedProjects([]);
-      return;
-    }
-    setLoadingList(true);
-    listNamedProjects()
-      .then(setNamedProjects)
-      .finally(() => setLoadingList(false));
-  };
-
-  useEffect(() => {
-    refreshNamedProjects();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [saveDirHandle, listNamedProjects]);
-
-  const handleLoadNamed = async (proj: { name: string; handle: any }) => {
-    setLoadingNamed(proj.name);
-    setErrorMsg(null);
-    const res = await loadNamedProject(proj.handle);
-    setLoadingNamed(null);
-    if (!res.ok) {
-      setErrorMsg(res.message ?? '프로젝트를 불러오는 중 문제가 발생했습니다.');
-      return;
-    }
-    setView('editor');
-    onClose();
-  };
-
-  const handleDeleteNamed = async (name: string) => {
-    setDeletingName(name);
-    setErrorMsg(null);
-    const res = await deleteNamedProject(name);
-    setDeletingName(null);
-    setConfirmDelete(null);
-    if (!res.ok) {
-      setErrorMsg(res.message ?? '프로젝트를 삭제하는 중 문제가 발생했습니다.');
-      return;
-    }
-    refreshNamedProjects();
-  };
-
-  const handlePickFolder = async () => {
-    setErrorMsg(null);
-    setSelectedFile(null);
-    setBrowsingFolder(true);
-    try {
-      const handle = await pickDirectory('read');
-      if (!handle) {
-        setBrowsingFolder(false);
-        return; // 사용자가 취소했거나 미지원 브라우저
-      }
-      const files = await listJsonFiles(handle);
-      setFolderName(handle.name);
-      if (files.length === 0) {
-        setFolderProjects([]);
-        setErrorMsg('선택한 폴더에서 프로젝트 JSON 파일을 찾지 못했습니다.');
-        return;
-      }
-      // 2026-07-27(2): 파일명/원문 JSON을 그대로 보여주지 않고, 각 파일을 미리 읽어
-      // 이름/장면 수/썸네일/수정일이 있는 예쁜 카드로 보여줍니다.
-      const previews = await Promise.all(
-        files.map(async (f): Promise<FolderProjectPreview> => {
-          try {
-            const data = await readJsonFile(f.handle);
-            if (!data || !Array.isArray(data.scenes)) {
-              return { name: f.name, handle: f.handle, title: f.name.replace(/\.json$/i, ''), sceneCount: null, modifiedAt: null, valid: false };
-            }
-            return {
-              name: f.name,
-              handle: f.handle,
-              title: typeof data.name === 'string' && data.name.trim() ? data.name : f.name.replace(/\.json$/i, ''),
-              sceneCount: data.scenes.length,
-              modifiedAt: typeof data.modifiedAt === 'string' ? data.modifiedAt : null,
-              thumbnail: typeof data.thumbnail === 'string' ? data.thumbnail : data.scenes[0]?.photoRef,
-              valid: true,
-            };
-          } catch {
-            return { name: f.name, handle: f.handle, title: f.name.replace(/\.json$/i, ''), sceneCount: null, modifiedAt: null, valid: false };
-          }
-        })
-      );
-      setFolderProjects(previews);
-    } catch (err) {
-      console.error(err);
-      setErrorMsg('폴더를 여는 중 문제가 발생했습니다. 폴더 접근 권한을 확인해주세요.');
-    } finally {
-      setBrowsingFolder(false);
-    }
-  };
-
-  const handleLoadFromFolderFile = async (fileEntry: { name: string; handle: any }) => {
-    setErrorMsg(null);
-    setLoadingFile(true);
-    try {
-      const data = await readJsonFile(fileEntry.handle);
-      if (!data || !Array.isArray(data.scenes)) {
-        setErrorMsg('올바른 프로젝트 파일 형식이 아닙니다 (장면 목록이 없습니다).');
-        return;
-      }
-      const now = new Date().toISOString();
-      const project: Project = {
-        id: typeof data.id === 'string' ? data.id : `proj_${Date.now()}`,
-        name: typeof data.name === 'string' && data.name.trim() ? data.name : fileEntry.name.replace(/\.json$/i, ''),
-        folderPath: typeof data.folderPath === 'string' ? data.folderPath : `/${folderName ?? ''}`,
-        createdAt: typeof data.createdAt === 'string' ? data.createdAt : now,
-        modifiedAt: typeof data.modifiedAt === 'string' ? data.modifiedAt : now,
-        scenes: data.scenes as Scene[],
-        thumbnail: typeof data.thumbnail === 'string' ? data.thumbnail : data.scenes[0]?.photoRef,
-      };
-      setCurrentProject(project);
-      setView('editor');
-      onClose();
-    } catch (err) {
-      console.error(err);
-      setErrorMsg('파일을 읽는 중 문제가 발생했습니다. 올바른 프로젝트 파일인지 확인해주세요.');
-    } finally {
-      setLoadingFile(false);
-    }
-  };
-
-  const modalBg = darkMode ? 'bg-neutral-900 border-neutral-800' : 'bg-white border-neutral-200';
-
-  return (
-    <ModalBackdrop onClose={onClose}>
-      <div className={cn('w-full max-w-2xl max-h-[85vh] overflow-y-auto scrollbar-hide rounded-2xl border shadow-2xl', modalBg)}>
-        <div className={cn('flex items-center justify-between px-6 py-4 border-b sticky top-0 z-10', modalBg, darkMode ? 'border-neutral-800' : 'border-neutral-200')}>
-          <div className="flex items-center gap-2">
-            {onBack && (
-              <button
-                onClick={onBack}
-                title="가져오기 목록으로"
-                className={cn('w-7 h-7 -ml-1 flex items-center justify-center rounded-lg shrink-0', darkMode ? 'hover:bg-neutral-800' : 'hover:bg-neutral-100')}
-              >
-                <ArrowLeft className="w-4 h-4" />
-              </button>
-            )}
-            <FolderOpen className="w-5 h-5 text-indigo-500" />
-            <h2 className="font-bold text-base">프로젝트 불러오기</h2>
-          </div>
-          <button onClick={onClose} className={cn('w-7 h-7 flex items-center justify-center rounded-lg', darkMode ? 'hover:bg-neutral-800' : 'hover:bg-neutral-100')}>
-            <X className="w-4 h-4" />
-          </button>
-        </div>
-
-        <div className="p-6 space-y-5">
-          {/* 연결된 저장 폴더의 프로젝트 */}
-          <div>
-            <p className="text-xs mb-2 font-semibold text-indigo-500">
-              {saveDirHandle ? `"${saveDirName}" 저장 폴더의 프로젝트` : '연결된 저장 폴더의 프로젝트'}
-            </p>
-            {!saveDirHandle ? (
-              <div className="flex items-start gap-2 text-xs text-neutral-500 bg-neutral-500/10 rounded-lg px-3 py-2.5">
-                <Info className="w-3.5 h-3.5 shrink-0 mt-0.5" />
-                <span>저장 폴더를 연결하면 그 안에 저장해둔 프로젝트들이 여기 자동으로 나타납니다. (상단 저장 폴더 연결 버튼)</span>
-              </div>
-            ) : loadingList ? (
-              <div className="flex items-center gap-2 text-xs text-neutral-400 px-1 py-2">
-                <Loader2 className="w-3.5 h-3.5 animate-spin" /> 목록 불러오는 중...
-              </div>
-            ) : namedProjects.length === 0 ? (
-              <p className={cn('text-xs px-1', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>
-                아직 이 폴더에 저장된 프로젝트가 없습니다. "새 프로젝트"로 먼저 저장해보세요.
-              </p>
-            ) : (
-              <div className="space-y-1.5 max-h-52 overflow-y-auto scrollbar-hide">
-                {namedProjects.map((proj) => (
-                  <div
-                    key={proj.name}
-                    className={cn(
-                      'w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg border text-left text-xs transition-colors',
-                      darkMode ? 'border-neutral-700 bg-neutral-900/60' : 'border-neutral-200 bg-white'
-                    )}
-                  >
-                    <button
-                      onClick={() => handleLoadNamed(proj)}
-                      disabled={loadingNamed === proj.name}
-                      className="flex items-center gap-2.5 flex-1 min-w-0 disabled:opacity-50"
-                    >
-                      {loadingNamed === proj.name ? (
-                        <Loader2 className="w-3.5 h-3.5 shrink-0 animate-spin text-indigo-500" />
-                      ) : (
-                        <FileText className="w-3.5 h-3.5 shrink-0 text-indigo-500" />
-                      )}
-                      <span className="truncate font-mono flex-1 text-left">{proj.name.replace(/\.json$/i, '')}</span>
-                      {typeof proj.sceneCount === 'number' && (
-                        <span className={cn('shrink-0', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>{proj.sceneCount}개 장면</span>
-                      )}
-                      {proj.modifiedAt && (
-                        <span className={cn('shrink-0', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>
-                          {formatShortDateTime(proj.modifiedAt)}
-                        </span>
-                      )}
-                    </button>
-                    {confirmDelete === proj.name ? (
-                      <div className="flex items-center gap-1 shrink-0">
-                        <button
-                          onClick={() => handleDeleteNamed(proj.name)}
-                          disabled={deletingName === proj.name}
-                          className="px-2 py-1 rounded-md bg-rose-600 text-white hover:bg-rose-700 text-[11px] font-semibold"
-                        >
-                          {deletingName === proj.name ? <Loader2 className="w-3 h-3 animate-spin" /> : '삭제 확정'}
-                        </button>
-                        <button
-                          onClick={() => setConfirmDelete(null)}
-                          className={cn('px-2 py-1 rounded-md text-[11px]', darkMode ? 'text-neutral-400 hover:bg-neutral-800' : 'text-neutral-500 hover:bg-neutral-100')}
-                        >
-                          취소
-                        </button>
-                      </div>
-                    ) : (
-                      <button
-                        onClick={() => setConfirmDelete(proj.name)}
-                        title="이 프로젝트 삭제"
-                        className={cn(
-                          'shrink-0 w-6 h-6 flex items-center justify-center rounded-md transition-colors',
-                          darkMode ? 'text-neutral-500 hover:bg-rose-500/10 hover:text-rose-400' : 'text-neutral-400 hover:bg-rose-50 hover:text-rose-500'
-                        )}
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
-                    )}
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-
-          {/* 임의 폴더에서 불러오기 */}
-          <div>
-            <div className="flex items-center justify-between mb-2">
-              <label className="text-xs font-semibold text-indigo-500">다른 폴더에서 불러오기</label>
-              {fsSupported && (
-                <button
-                  type="button"
-                  onClick={handlePickFolder}
-                  disabled={browsingFolder}
-                  className={cn(
-                    'flex items-center gap-1 text-xs font-medium px-2 py-1 rounded-md transition-colors disabled:opacity-50',
-                    darkMode ? 'text-indigo-400 hover:bg-indigo-500/10' : 'text-indigo-600 hover:bg-indigo-50'
-                  )}
-                >
-                  {browsingFolder ? (
-                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                  ) : (
-                    <FolderOpen className="w-3.5 h-3.5" />
-                  )}
-                  {folderName ? '다른 폴더 선택' : '폴더 선택'}
-                </button>
-              )}
-            </div>
-
-            {!fsSupported && (
-              <p className={cn('text-xs', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>
-                이 브라우저는 폴더 선택을 지원하지 않아요(Chrome/Edge 권장).
-              </p>
-            )}
-
-            {folderName && (
-              <div className={cn('mt-2 rounded-xl border p-3', darkMode ? 'border-neutral-800 bg-neutral-800/40' : 'border-neutral-200 bg-neutral-50')}>
-                <p className={cn('text-xs mb-2 flex items-center gap-1.5', darkMode ? 'text-neutral-400' : 'text-neutral-500')}>
-                  <Folder className="w-3.5 h-3.5" />
-                  "{folderName}" 폴더 — 프로젝트 {folderProjects.length}개
-                </p>
-                {folderProjects.length > 0 && (
-                  <div className="space-y-2 max-h-64 overflow-y-auto scrollbar-hide">
-                    {folderProjects.map((proj) => (
-                      <button
-                        key={proj.name}
-                        onClick={() => {
-                          if (!proj.valid) return;
-                          setSelectedFile(proj.name);
-                          handleLoadFromFolderFile(proj);
-                        }}
-                        disabled={loadingFile || !proj.valid}
-                        className={cn(
-                          'w-full flex items-center gap-3 p-2.5 rounded-lg border text-left transition-colors disabled:opacity-50',
-                          selectedFile === proj.name
-                            ? 'border-indigo-500 bg-indigo-50 dark:bg-indigo-500/10'
-                            : darkMode
-                            ? 'border-neutral-700 hover:border-neutral-600 bg-neutral-900/60'
-                            : 'border-neutral-200 hover:border-neutral-300 bg-white'
-                        )}
-                      >
-                        <div className="w-16 h-10 rounded-md overflow-hidden shrink-0 bg-neutral-200">
-                          {proj.valid ? (
-                            <img src={getSceneImageSrc(proj.thumbnail)} alt={proj.title} className="w-full h-full object-cover" />
-                          ) : (
-                            <div className="w-full h-full flex items-center justify-center">
-                              <ImageOff className="w-4 h-4 text-neutral-400" />
-                            </div>
-                          )}
-                        </div>
-                        <div className="flex-1 min-w-0">
-                          <p className="text-xs font-semibold truncate flex items-center gap-1.5">
-                            {loadingFile && selectedFile === proj.name && <Loader2 className="w-3 h-3 animate-spin text-indigo-500" />}
-                            {proj.title}
-                          </p>
-                          {proj.valid ? (
-                            <div className={cn('flex gap-2 mt-0.5 text-[11px]', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>
-                              <span>{proj.sceneCount}개 장면</span>
-                              {proj.modifiedAt && (
-                                <>
-                                  <span>·</span>
-                                  <span>수정: {formatShortDateTime(proj.modifiedAt)}</span>
-                                </>
-                              )}
-                            </div>
-                          ) : (
-                            <p className="text-[11px] text-rose-400 mt-0.5">프로젝트 형식이 아닌 파일입니다</p>
-                          )}
-                        </div>
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {errorMsg && (
-              <div className="mt-2 flex items-start gap-2 text-xs text-rose-500 bg-rose-500/10 rounded-lg px-3 py-2">
-                <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
-                <span>{errorMsg}</span>
-              </div>
-            )}
-          </div>
-        </div>
-
-        <div className={cn('px-6 py-4 border-t flex justify-end gap-2 sticky bottom-0', modalBg, darkMode ? 'border-neutral-800' : 'border-neutral-200')}>
-          <button onClick={onClose} className={cn('px-4 py-2 text-sm rounded-lg transition-colors', darkMode ? 'hover:bg-neutral-800 text-neutral-400' : 'hover:bg-neutral-100 text-neutral-500')}>
-            닫기
-          </button>
-        </div>
-      </div>
-    </ModalBackdrop>
-  );
-}
-
 // ─── Export Modal ─────────────────────────────────────────────────────────────
 
-function downloadTextFile(fileName: string, content: string, mime: string) {
-  const blob = new Blob([content], { type: mime });
+/**
+ * 2026-08-01: 사용자가 저장 대화상자를 취소했을 때 쓰는 표시자입니다. 일반적인 오류와
+ * 달리 오류 배너를 띄우지 않고 조용히 되돌아가기 위해 구분합니다.
+ */
+class ExportCancelledError extends Error {
+  constructor() {
+    super('사용자가 저장을 취소했습니다.');
+    this.name = 'ExportCancelledError';
+  }
+}
+
+/**
+ * 2026-08-01: 내보내기 파일을 저장합니다. File System Access API(showSaveFilePicker)를
+ * 지원하는 브라우저(Chrome/Edge 등)에서는 "어디에 저장할지" 직접 물어보는 대화상자를
+ * 띄우며, 기본 시작 위치는 바탕화면(desktop)입니다 — "다운로드는 어디 저장할지 물어보고,
+ * 보통은 바탕화면에 저장할 것"이라는 요구사항을 그대로 반영합니다. 이 대화상자 하나로
+ * 저장이 끝나므로, 예전처럼 "다운로드 + 저장 폴더에도 저장"을 이중으로 할 필요가
+ * 없습니다(내보내기는 파일당 1번만 저장). 지원하지 않는 구형 브라우저에서는 기존처럼
+ * 브라우저 기본 다운로드로 대체합니다. 사용자가 대화상자를 취소하면 ExportCancelledError를
+ * 던져, 호출부가 오류 배너 없이 조용히 되돌아갈 수 있게 합니다.
+ */
+async function saveExportFile(fileName: string, blob: Blob, mimeType: string, description: string): Promise<void> {
+  const picker = (window as any).showSaveFilePicker;
+  if (typeof picker === 'function') {
+    try {
+      const ext = fileName.includes('.') ? fileName.slice(fileName.lastIndexOf('.')) : '';
+      const handle = await picker({
+        suggestedName: fileName,
+        startIn: 'desktop',
+        types: [{ description, accept: { [mimeType]: [ext] } }],
+      });
+      const writable = await handle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      return;
+    } catch (err: any) {
+      if (err?.name === 'AbortError') throw new ExportCancelledError();
+      // 저장 대화상자 자체를 지원하지 않거나(구형 브라우저 정책 등) 다른 이유로 실패하면
+      // 아래 기본 다운로드 방식으로 대체합니다.
+    }
+  }
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -3068,11 +3001,9 @@ function openPrintableStoryboard(projectName: string, scenes: Scene[]) {
 }
 
 function ExportModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => void }) {
-  const { scenes, currentProject, saveDirHandle, saveDirName, pushEditLog, subtitleFontName } = useStore();
+  const { scenes, currentProject, pushEditLog, subtitleFontName } = useStore();
   const projectName = currentProject?.name ?? '스토리보드';
-  const [pathNote, setPathNote] = useState(currentProject ? `${currentProject.folderPath}/export` : '');
-  const [format, setFormat] = useState<'pdf' | 'json' | 'txt' | 'mp4'>('pdf');
-  const [alsoSaveToFolder, setAlsoSaveToFolder] = useState(true);
+  const [format, setFormat] = useState<'pdf' | 'json' | 'txt' | 'mp4' | 'media'>('pdf');
   const [aspect, setAspect] = useState<'16:9' | '9:16'>('16:9');
   const [quality, setQuality] = useState<'720' | '1080'>('720');
   const [captionStyle, setCaptionStyle] = useState<string>(DEFAULT_CAPTION_STYLE_ID);
@@ -3085,9 +3016,10 @@ function ExportModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => 
 
   const formats = [
     { id: 'pdf', label: 'PDF 스토리보드', desc: '브라우저 인쇄창으로 저장' },
-    { id: 'json', label: 'JSON 프로젝트', desc: '원본 데이터 백업 (다운로드)' },
-    { id: 'txt', label: '텍스트 스크립트', desc: '나레이션/대사만 (다운로드)' },
-    { id: 'mp4', label: 'MP4 영상', desc: 'FFmpeg으로 자막을 입힌 영상 (SRT/TXT 자막 포함)' },
+    { id: 'json', label: 'JSON 프로젝트', desc: '원본 데이터 백업' },
+    { id: 'txt', label: '스크립트', desc: '나레이션/대사만' },
+    { id: 'mp4', label: 'MP4 영상', desc: 'FFmpeg으로 자막을 입힌 영상 (SRT/스크립트 포함)' },
+    { id: 'media', label: '이미지·영상 (ZIP)', desc: '장면에 쓰인 사진/영상 파일 모음' },
   ] as const;
 
   const safeName = projectName.replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, '_');
@@ -3108,19 +3040,6 @@ function ExportModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => 
       cancelled = true;
     };
   }, [format]);
-
-  const writeExportToSaveFolder = async (fileName: string, content: string) => {
-    if (!saveDirHandle) return;
-    const dataDir = await getDataDir(saveDirHandle);
-    const exportsDir = await getOrCreateSubDirectory(dataDir, 'exports');
-    await writeTextFile(exportsDir, fileName, content);
-  };
-
-  const triggerDownload = (url: string) => {
-    const a = document.createElement('a');
-    a.href = url;
-    a.click();
-  };
 
   const handleMp4Export = async () => {
     const missing = scenes.filter((sc) => !sc.localVideoUrl && !sc.photoRef);
@@ -3170,10 +3089,69 @@ function ExportModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => 
       });
     }
 
-    setProgressLabel('다운로드를 시작합니다...');
-    triggerDownload(`/api/export/video/${data.jobId}/${data.files.mp4}`);
-    setTimeout(() => triggerDownload(`/api/export/video/${data.jobId}/${data.files.srt}`), 400);
-    setTimeout(() => triggerDownload(`/api/export/video/${data.jobId}/${data.files.txt}`), 800);
+    // 2026-08-01: 다운로드는 어디에 저장할지 물어봅니다(기본 시작 위치: 바탕화면). MP4는
+    // 반드시 필요한 결과물이라 취소하면 전체 내보내기를 취소로 처리하고, SRT/스크립트는
+    // 부가 파일이라 그 저장을 취소해도 이미 저장된 MP4는 그대로 유지됩니다.
+    setProgressLabel('저장할 위치를 선택해주세요...');
+    const mp4Blob = await (await fetch(`/api/export/video/${data.jobId}/${data.files.mp4}`)).blob();
+    await saveExportFile(data.files.mp4, mp4Blob, 'video/mp4', 'MP4 영상');
+
+    try {
+      const srtBlob = await (await fetch(`/api/export/video/${data.jobId}/${data.files.srt}`)).blob();
+      await saveExportFile(data.files.srt, srtBlob, 'application/x-subrip', 'SRT 자막');
+    } catch (err) {
+      if (!(err instanceof ExportCancelledError)) throw err;
+    }
+    try {
+      const txtBlob = await (await fetch(`/api/export/video/${data.jobId}/${data.files.txt}`)).blob();
+      await saveExportFile(data.files.txt, txtBlob, 'text/plain', '스크립트');
+    } catch (err) {
+      if (!(err instanceof ExportCancelledError)) throw err;
+    }
+  };
+
+  /**
+   * 2026-08-01: 장면에 등록된 사진/영상 파일들을 모아 ZIP 하나로 내보냅니다
+   * ("이미지 영상파일도 알집으로 내보내기 되도록 해줘" 요청). 사진이 없는(placeholder)
+   * 장면은 건너뛰고, 실제 파일이 하나도 없으면 이유를 알려주고 중단합니다.
+   */
+  const handleMediaZipExport = async () => {
+    setProgressLabel('사진/영상 파일을 모으는 중...');
+    const JSZip = (await import('jszip')).default;
+    const zip = new JSZip();
+    let count = 0;
+    for (let i = 0; i < scenes.length; i++) {
+      const sc = scenes[i];
+      const src = sc.localVideoUrl || sc.photoRef;
+      if (!src || src.startsWith('data:image/svg')) continue; // 등록된 사진/영상이 없는 장면(placeholder)은 건너뜁니다.
+      try {
+        const blob = await (await fetch(src)).blob();
+        const isVideo = !!sc.localVideoUrl;
+        const baseName = `${String(i + 1).padStart(2, '0')}_${(sc.customTitle || '장면').replace(/[\\/:*?"<>|]/g, '_')}`;
+        const originalName = sc.localVideoName || sc.localImageName;
+        const ext =
+          originalName && originalName.includes('.')
+            ? originalName.split('.').pop()!
+            : isVideo
+            ? 'mp4'
+            : blob.type.includes('png')
+            ? 'png'
+            : blob.type.includes('webp')
+            ? 'webp'
+            : 'jpg';
+        zip.file(`${baseName}.${ext}`, blob);
+        count++;
+      } catch (err) {
+        console.error(`"${sc.customTitle}" 장면의 사진/영상을 ZIP에 담지 못했습니다:`, err);
+      }
+    }
+    if (count === 0) {
+      throw new Error('내보낼 사진/영상이 없습니다. 장면에 사진이나 영상을 먼저 등록해주세요.');
+    }
+    setProgressLabel('ZIP 파일로 압축하는 중...');
+    const content = await zip.generateAsync({ type: 'blob' });
+    setProgressLabel('저장할 위치를 선택해주세요...');
+    await saveExportFile(`${safeName}_media.zip`, content, 'application/zip', 'ZIP 파일');
   };
 
   const handleExport = async () => {
@@ -3189,22 +3167,28 @@ function ExportModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => 
           scenes: sanitizeScenesForSave(scenes),
         };
         const text = JSON.stringify(payload, null, 2);
-        const fileName = `${safeName}.json`;
-        downloadTextFile(fileName, text, 'application/json');
-        if (alsoSaveToFolder && saveDirHandle) await writeExportToSaveFolder(fileName, text);
+        const blob = new Blob([text], { type: 'application/json' });
+        setProgressLabel('저장할 위치를 선택해주세요...');
+        await saveExportFile(`${safeName}.json`, blob, 'application/json', 'JSON 파일');
       } else if (format === 'txt') {
         const text = buildScriptText(projectName, scenes);
-        const fileName = `${safeName}.txt`;
-        downloadTextFile(fileName, text, 'text/plain;charset=utf-8');
-        if (alsoSaveToFolder && saveDirHandle) await writeExportToSaveFolder(fileName, text);
+        const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+        setProgressLabel('저장할 위치를 선택해주세요...');
+        await saveExportFile(`${safeName}.txt`, blob, 'text/plain', '스크립트 파일');
       } else if (format === 'pdf') {
         openPrintableStoryboard(projectName, scenes);
+      } else if (format === 'media') {
+        await handleMediaZipExport();
       } else if (format === 'mp4') {
         await handleMp4Export();
       }
       pushEditLog('export', `"${projectName}" ${format.toUpperCase()} 형식으로 내보내기`);
       setDone(true);
     } catch (err: any) {
+      if (err instanceof ExportCancelledError) {
+        // 저장 위치 선택을 취소한 경우 — 오류로 취급하지 않고 조용히 되돌아갑니다.
+        return;
+      }
       console.error(err);
       setErrorMsg(err?.message || '내보내는 중 문제가 발생했습니다.');
       setErrorDetail(err?.detail);
@@ -3342,51 +3326,11 @@ function ExportModal({ darkMode, onClose }: { darkMode: boolean; onClose: () => 
             </div>
           )}
 
-          {/* 저장 폴더에도 저장 */}
-          {(format === 'json' || format === 'txt') && (
-            <div>
-              {saveDirHandle ? (
-                <label className="flex items-center gap-2 text-xs cursor-pointer select-none">
-                  <input
-                    type="checkbox"
-                    checked={alsoSaveToFolder}
-                    onChange={(e) => setAlsoSaveToFolder(e.target.checked)}
-                    className="accent-indigo-500 w-3.5 h-3.5"
-                  />
-                  <span>
-                    다운로드와 함께 저장 폴더("{saveDirName}"/KWJMvideoAI_data/exports/)에도 저장
-                  </span>
-                </label>
-              ) : (
-                <p className={cn('text-xs flex items-center gap-1.5', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>
-                  <Info className="w-3.5 h-3.5 shrink-0" />
-                  저장 폴더를 연결하면 다운로드와 함께 저장 폴더에도 백업할 수 있습니다.
-                </p>
-              )}
-            </div>
-          )}
-
-          {/* 참고용 경로 메모 */}
-          {format !== 'mp4' && (
-            <div>
-              <label className="text-xs font-semibold mb-1.5 block text-indigo-500">참고용 경로 메모</label>
-              <div className="relative">
-                <Folder className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-neutral-400" />
-                <input
-                  type="text"
-                  value={pathNote}
-                  onChange={(e) => setPathNote(e.target.value)}
-                  placeholder="예: /documents/KWJMvideoAI/export"
-                  className={cn(
-                    'w-full pl-9 pr-3 py-2.5 text-sm rounded-lg border focus:outline-none focus:ring-2 focus:ring-indigo-500/40 font-mono',
-                    darkMode ? 'bg-neutral-800 border-neutral-700 text-neutral-100' : 'bg-neutral-50 border-neutral-200 text-neutral-900'
-                  )}
-                />
-              </div>
-              <p className={cn('text-xs mt-1', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>
-                실제 다운로드 위치는 브라우저의 기본 다운로드 폴더를 따릅니다. 이 메모는 정리용 참고 텍스트일 뿐입니다.
-              </p>
-            </div>
+          {format !== 'pdf' && (
+            <p className={cn('text-xs flex items-start gap-1.5', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>
+              <Info className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+              내보내기를 누르면 저장할 위치를 직접 고를 수 있는 창이 뜹니다(기본 시작 위치: 바탕화면). 작업물 자체는 항상 자동 저장되고 있으니, 내보내기는 이 파일을 딱 1번만 저장하면 됩니다.
+            </p>
           )}
 
           {/* Summary */}
@@ -3733,7 +3677,9 @@ function BlogImportModal({ darkMode, onClose, onBack }: { darkMode: boolean; onC
     (async () => {
       const entries = await Promise.all(
         filteredPosts.slice(0, 24).map(async (p) => {
-          const firstMedia = blogMedia.find((m) => m.postId === p.id);
+          // 2026-08-01: 오디오는 썸네일로 미리볼 수 없으므로(그림/영상이 아님) 제외하고,
+          // 사진 또는 영상 중 첫 번째 항목만 목록 썸네일로 사용합니다.
+          const firstMedia = blogMedia.find((m) => m.postId === p.id && (m.type === 'image' || m.type === 'video'));
           if (!firstMedia) return [p.id, ''] as const;
           const url = await blogMediaPreviewUrl(blogDirHandle, firstMedia);
           return [p.id, url ?? ''] as const;
@@ -3817,7 +3763,12 @@ function BlogImportModal({ darkMode, onClose, onBack }: { darkMode: boolean; onC
         return pa < pb ? -1 : pa > pb ? 1 : 0;
       });
       const posts = blogPosts.filter((p) => ids.includes(p.id));
-      const media = getMediaForPosts(blogMedia, ids);
+      // 2026-08-01: 오디오는 사진/영상 자리에 쓸 수 없으므로 장면-미디어 매칭에서 제외합니다.
+      // 오디오만 있고 사진/영상이 없는 글은 아래 textOnlyPosts(본문 기반 장면) 경로로 자연스럽게
+      // 넘어가고, 그 오디오의 캡션은 아래에서 본문 요약에 덧붙여 정보 손실 없이 반영됩니다.
+      const media = getMediaForPosts(blogMedia, ids).filter(
+        (m): m is BlogMediaMeta & { type: 'image' | 'video' } => m.type === 'image' || m.type === 'video'
+      );
       const postsWithMediaIds = new Set(media.map((m) => m.postId));
       const textOnlyPosts = posts.filter((p) => !postsWithMediaIds.has(p.id));
 
@@ -3877,13 +3828,21 @@ function BlogImportModal({ darkMode, onClose, onBack }: { darkMode: boolean; onC
       // (화면에는 아이콘 기반 "이미지 없음" 표시가 나타납니다)
       if (textOnlyPosts.length > 0) {
         setBuildStage('사진·영상이 없는 글은 본문 내용으로 장면을 작성하는 중...');
-        const textDescriptors: PostTextDescriptor[] = textOnlyPosts.map((p) => ({
-          id: p.id,
-          title: p.title,
-          content: stripHtml(p.content),
-          location: p.location || undefined,
-          date: p.createdAt?.slice(0, 10),
-        }));
+        const textDescriptors: PostTextDescriptor[] = textOnlyPosts.map((p) => {
+          // 2026-08-01: 사진/영상은 없지만 오디오가 첨부된 글은, 오디오 캡션을 본문 요약에
+          // 덧붙여 "모든 관련 데이터"가 스토리보드 생성 컨텍스트에 반영되도록 합니다.
+          const audioCaptions = blogMedia
+            .filter((m) => m.postId === p.id && m.type === 'audio' && m.caption)
+            .map((m) => m.caption);
+          const audioNote = audioCaptions.length > 0 ? `\n(첨부된 오디오 설명: ${audioCaptions.join(', ')})` : '';
+          return {
+            id: p.id,
+            title: p.title,
+            content: stripHtml(p.content) + audioNote,
+            location: p.location || undefined,
+            date: p.createdAt?.slice(0, 10),
+          };
+        });
         const writtenText = await generateStoryboardFromPosts({
           items: textDescriptors,
           settings: { baseUrl: llmBaseUrl, model: llmModel, mode: llmMode },
@@ -4041,7 +4000,9 @@ function BlogImportModal({ darkMode, onClose, onBack }: { darkMode: boolean; onC
                 {filteredPosts.map((post) => {
                   const isChecked = checked.has(post.id);
                   const preview = previewUrls[post.id];
-                  const mediaCount = blogMedia.filter((m) => m.postId === post.id).length;
+                  // 2026-08-01: 오디오는 "사진/영상"이 아니므로 개수를 따로 셉니다.
+                  const mediaCount = blogMedia.filter((m) => m.postId === post.id && (m.type === 'image' || m.type === 'video')).length;
+                  const audioCount = blogMedia.filter((m) => m.postId === post.id && m.type === 'audio').length;
                   return (
                     <button
                       key={post.id}
@@ -4075,7 +4036,7 @@ function BlogImportModal({ darkMode, onClose, onBack }: { darkMode: boolean; onC
                           <p className="text-xs font-medium truncate">{post.title}</p>
                         </div>
                         <p className={cn('text-[11px] mt-0.5 truncate', darkMode ? 'text-neutral-500' : 'text-neutral-400')}>
-                          {post.createdAt.slice(0, 10)}{post.location ? ` · ${post.location}` : ''} · {mediaCount > 0 ? `사진/영상 ${mediaCount}개` : '사진/영상 없음 (글 내용으로 생성)'}
+                          {post.createdAt.slice(0, 10)}{post.location ? ` · ${post.location}` : ''} · {mediaCount > 0 ? `사진/영상 ${mediaCount}개` : '사진/영상 없음 (글 내용으로 생성)'}{audioCount > 0 ? ` · 오디오 ${audioCount}개` : ''}
                         </p>
                       </div>
                     </button>

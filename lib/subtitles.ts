@@ -104,7 +104,11 @@ export function totalDuration(scenes: SubtitleScene[]): number {
 /** 한국어 자막 기준 대략적인 초당 읽기 글자 수 (평균적인 시청 속도 가정). */
 const READING_CHARS_PER_SECOND = 6.5;
 const MIN_SCENE_SECONDS = 2;
-const MAX_AUTO_SCENE_SECONDS = 20;
+// 2026-08-02: 수동 재생시간 슬라이더 상한을 20초 → 10초로 줄인 것과 맞춰, AI가 자동으로
+// 붙이는 재생시간도 10초를 넘기지 않도록 합니다(그래야 AI가 만든 값도 슬라이더 범위 안에
+// 그대로 표시됩니다). 영상(local video)이 적용된 장면은 이 상한과 무관하게 실제 영상
+// 길이를 그대로 쓰므로 별도로 처리됩니다(store/useStore.ts의 applyLocalVideoToScene 참고).
+const MAX_AUTO_SCENE_SECONDS = 10;
 
 /** 나레이션+대사 텍스트 길이로부터 자막을 편안히 읽을 수 있는 최소 재생시간(초)을 추정합니다. */
 export function estimateReadingDurationSeconds(narration: string, dialogue?: string): number {

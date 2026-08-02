@@ -365,8 +365,11 @@ export function buildBlogContextText(
     if (text) lines.push(`  본문 요약: ${text}`);
     const postMedia = media.filter((m) => m.postId === post.id).sort((a, b) => a.order - b.order);
     for (const m of postMedia) {
+      // 2026-08-01: 오디오(type: 'audio')도 실제 블로그 데이터이므로 라벨을 정확히 구분해
+      // 보여줍니다. 사진/영상이 아니므로 mediaId로 선택할 수 없다는 점도 함께 안내합니다.
+      const mediaTypeLabel = m.type === 'video' ? '영상' : m.type === 'audio' ? '오디오(사진/영상 아님, mediaId로 선택 불가)' : '사진';
       lines.push(
-        `  · media id=${m.id} (${m.type === 'video' ? '영상' : '사진'}) 캡션="${m.caption || '(없음)'}" 장소="${m.location || post.location || '(없음)'}" 날짜=${m.year}-${m.month}-${m.day}`
+        `  · media id=${m.id} (${mediaTypeLabel}) 캡션="${m.caption || '(없음)'}" 장소="${m.location || post.location || '(없음)'}" 날짜=${m.year}-${m.month}-${m.day}`
       );
     }
   }
@@ -402,8 +405,10 @@ const STORYBOARD_JSON_INSTRUCTION = `지금까지의 대화 내용과(있다면)
 - tags 필드에는 위 "핵심 키워드"나 각 글의 태그·카테고리·장소 중, 그 장면의 실제 내용과 관련 있는
   것을 우선적으로 사용하세요. 관련 키워드가 없으면 장면 내용을 잘 나타내는 다른 짧은 단어를 쓰세요.
 - [연결된 블로그 데이터]가 대화에 포함되어 있다면, mediaId는 반드시 거기 나열된 media id 값 중
-  하나를 그대로 사용하세요. 목록에 없는 값을 새로 만들지 마세요. 그 데이터가 없거나 어울리는 사진이
-  없으면 mediaId는 null로 두세요.
+  "사진" 또는 "영상" 항목의 id만 사용하세요(목록에 없는 값을 새로 만들지 마세요). "오디오" 라벨이
+  붙은 항목은 장면의 사진/영상으로 쓸 수 없으니 mediaId로 선택하지 마세요 — 대신 그 오디오의 캡션
+  내용이 관련 있다면 narration 문장에 자연스럽게 녹여도 됩니다. 어울리는 사진/영상이 없으면
+  mediaId는 null로 두세요.
 - 같은 mediaId를 여러 장면에서 중복 사용하지 마세요. 사용 가능한 사진 수가 장면 수보다 적어서
   불가피한 경우에만 예외로 허용합니다.
 - 장면의 캡션/장소/날짜와 어울리지 않는 mediaId를 억지로 배정하지 마세요 — 차라리 null로 두는
@@ -619,7 +624,9 @@ export async function generateStoryboardFromChat(params: {
     return messages;
   };
 
-  const validMediaIds = new Set(blogMedia.map((m) => m.id));
+  // 2026-08-01: 오디오 항목은 장면의 사진/영상 자리에 쓸 수 없으므로, LLM이 지침을 어기고
+  // 오디오의 mediaId를 골라도 여기서 걸러 null로 처리합니다(사진/영상만 유효한 mediaId).
+  const validMediaIds = new Set(blogMedia.filter((m) => m.type === 'image' || m.type === 'video').map((m) => m.id));
 
   // 3차 폴백(절대 실패하지 않음): 대화의 사용자 메시지들을 그대로 장면으로 변환합니다.
   const fallback = (): RawStoryboardScene[] => {
@@ -829,7 +836,7 @@ ${lines.join('\n')}
 ]
 
 규칙:
-- duration은 3~20 사이의 정수(초)로 하세요 (사진/영상이 없으므로 나레이션 길이에 맞게 조금 더 길어도 됩니다).
+- duration은 3~10 사이의 정수(초)로 하세요.
 - 본문에 없는 사실을 지어내지 마세요.`;
 }
 
@@ -888,42 +895,199 @@ export async function generateStoryboardFromPosts(params: {
   });
 }
 
-/** 하나의 씬에 대해 나레이션을 다시 만들어달라고 LLM에 요청합니다. */
+/**
+ * 하나의 씬에 대해 "제목/나레이션/대사" 중 하나를 AI로 다시 만들어달라고 LLM에 요청합니다.
+ *
+ * 2026-08-01: 예전에는 나레이션(+대사)만 한 번에 재생성할 수 있었지만, 이제 장면 제목·
+ * 나레이션·대사를 각각 독립적으로 AI 생성할 수 있어야 한다는 요구사항에 맞춰 target으로
+ * 어떤 항목을 다시 쓸지 고를 수 있게 했습니다. 응답 JSON 파싱에 실패하면(일부 로컬 모델이
+ * 형식을 깨거나 설명을 덧붙이는 경우) 토큰 예산을 늘려 한 번 더 시도한 뒤에만 실패로
+ * 처리합니다 — generateJsonWithGuaranteedFallback과 같은 원칙입니다.
+ */
 export async function regenerateSceneNarration(params: {
   scene: Scene;
   allScenes: Scene[];
   settings: LlmSettings;
-}): Promise<{ narration: string; dialogue: string }> {
-  const { scene, allScenes, settings } = params;
+  target?: 'title' | 'narration' | 'dialogue';
+}): Promise<{ customTitle: string; narration: string; dialogue: string }> {
+  const { scene, allScenes, settings, target = 'narration' } = params;
   const idx = allScenes.findIndex((s) => s.id === scene.id);
   const context = allScenes
     .map((s, i) => `${i + 1}. ${s.customTitle}${i === idx ? ' ← 이 장면을 다시 작성' : ''}`)
     .join('\n');
 
+  const targetLabel = target === 'title' ? '장면 제목' : target === 'dialogue' ? '등장인물 대사' : '나레이션';
+  const jsonKey = target === 'title' ? 'customTitle' : target;
+  const instructionByTarget: Record<'title' | 'narration' | 'dialogue', string> = {
+    title: '요청받은 한 장면의 "제목(customTitle)"만 한국어로 짧고 매력적으로 새로 지어주세요. 나레이션/대사 내용과 어울려야 합니다.',
+    narration: '요청받은 한 장면의 "나레이션(narration)"만 한국어로 다시 작성해주세요(2~4문장).',
+    dialogue:
+      '요청받은 한 장면의 "등장인물 대사(dialogue)"만 한국어로 다시 작성해주세요. 대사가 어울리지 않는 장면이면 빈 문자열("")로 두어도 됩니다.',
+  };
+
   const messages: OpenAiMessage[] = [
     {
       role: 'system',
       content:
-        '당신은 영상 나레이션 작가입니다. 요청받은 한 장면의 나레이션과 대사를 한국어로 다시 작성합니다. ' +
-        '다른 설명 없이 아래 JSON 형식 하나만 출력하세요: {"narration":"...","dialogue":"..."} (대사가 없으면 dialogue는 빈 문자열)',
+        `당신은 영상 나레이션 작가입니다. ${instructionByTarget[target]} ` +
+        `다른 설명, 코드블록 표시 없이 아래 JSON 형식 하나만 출력하세요: {"${jsonKey}":"..."}`,
     },
     {
       role: 'user',
-      content: `전체 장면 순서:\n${context}\n\n다시 작성할 장면 정보:\n제목: ${scene.customTitle}\n기존 나레이션: ${scene.narration}\n기존 대사: ${scene.dialogue || '(없음)'}\n태그: ${(scene.tags ?? []).join(', ') || '(없음)'}\n재생시간: ${scene.duration}초\n\n같은 분위기를 유지하되 문장 표현을 새롭게 바꿔서 다시 작성해주세요.`,
+      content: `전체 장면 순서:\n${context}\n\n다시 작성할 장면 정보:\n제목: ${scene.customTitle}\n기존 나레이션: ${scene.narration}\n기존 대사: ${scene.dialogue || '(없음)'}\n재생시간: ${scene.duration}초\n\n같은 분위기를 유지하되 ${targetLabel} 표현을 새롭게 바꿔서 다시 작성해주세요.`,
     },
   ];
 
-  const text = await chatOnce(messages, { ...settings, temperature: 0.8, maxTokens: 400 });
-  try {
+  const fallback = { customTitle: scene.customTitle, narration: scene.narration, dialogue: scene.dialogue };
+
+  const attempt = async (maxTokens: number): Promise<{ customTitle: string; narration: string; dialogue: string } | null> => {
+    const text = await chatOnce(messages, { ...settings, temperature: 0.8, maxTokens });
     const start = text.indexOf('{');
     const end = text.lastIndexOf('}');
-    const parsed = JSON.parse(text.slice(start, end + 1));
-    return {
-      narration: typeof parsed.narration === 'string' ? parsed.narration.trim() : scene.narration,
-      dialogue: typeof parsed.dialogue === 'string' ? parsed.dialogue.trim() : scene.dialogue,
-    };
-  } catch {
-    // JSON 파싱에 실패하면 응답 텍스트 전체를 나레이션으로 사용합니다.
-    return { narration: text.trim(), dialogue: scene.dialogue };
+    if (start === -1 || end === -1 || end <= start) {
+      // JSON 형식이 아예 없으면 응답 텍스트 전체를 해당 필드 값으로 사용합니다.
+      const plain = text.trim();
+      if (!plain) return null;
+      return { ...fallback, [jsonKey]: plain };
+    }
+    try {
+      const parsed = JSON.parse(text.slice(start, end + 1));
+      const value = typeof parsed[jsonKey] === 'string' ? parsed[jsonKey].trim() : '';
+      if (!value && jsonKey !== 'dialogue') return null; // dialogue는 빈 문자열도 유효한 결과
+      return { ...fallback, [jsonKey]: value };
+    } catch {
+      return null;
+    }
+  };
+
+  let result = await attempt(target === 'title' ? 120 : 400);
+  if (!result) {
+    result = await attempt(target === 'title' ? 200 : 700);
   }
+  if (!result) {
+    throw new Error(`AI가 ${targetLabel} 내용을 만들어내지 못했습니다. LM Studio 모델 상태를 확인하고 다시 시도해주세요.`);
+  }
+  return result;
+}
+
+// ─── 타임라인 전체 AI 생성 (2026-08-02 추가) ───────────────────────────────────
+//
+// 요청사항: "왼쪽 타임라인 패널 상단에 텍스트 AI로 생성 버튼을 만들어서, 누르면 모든
+// 장면의 제목/나레이션/대사를 등록된 사진·영상을 참고해 AI가 한 번에 생성하되, 앞뒤
+// 장면이 이어져서 영화나 다큐멘터리처럼 자연스럽게 흘러가야 한다." regenerateSceneNarration은
+// 장면 하나씩만 다시 쓰지만, 이 함수는 타임라인 전체를 한 번의 요청으로 같이 보내
+// LLM이 전체 흐름을 한꺼번에 고려해서 쓰도록 합니다(각 장면을 따로따로 요청하면 앞뒤
+// 문맥이 끊길 수 있기 때문입니다).
+//
+// agent.md 10절에 설명된 대로 현재 LM Studio 모델은 텍스트 전용이라 사진/영상을 실제로
+// "보지" 못하므로, 각 장면에 등록된 파일명(사용자가 의미 있게 지어둔 경우 태그처럼 읽힘)과
+// 장면 순서만으로 AI가 자연스러운 흐름을 짓게 합니다 — 다른 스토리보드 생성 함수들과
+// 동일한 설계 원칙입니다.
+
+export interface AllScenesRegenerateResult {
+  id: string;
+  customTitle: string;
+  narration: string;
+  dialogue: string;
+}
+
+const ALL_SCENES_SYSTEM_PROMPT = `당신은 KWJMvideoAI의 영상 스토리보드 작가입니다.
+지금 이미 사진·영상이 등록된 여러 장면으로 구성된 타임라인이 있습니다. 각 장면의 파일명과
+현재 제목을 참고해서, 전체 장면이 마치 하나의 영화나 다큐멘터리처럼 자연스럽게 이어지도록
+모든 장면의 제목·나레이션·대사를 한국어로 새로 작성하세요. 각 장면은 반드시 바로 앞 장면에서
+자연스럽게 이어지고 바로 다음 장면으로 자연스럽게 연결되어야 합니다(도입-전개-마무리가 있는
+하나의 이야기처럼). 파일명이나 순서만으로는 알 수 없는 구체적 사실(장소명, 인물 이름, 날짜 등)을
+단정적으로 지어내지 말고, 분위기 있는 서술로 자연스럽게 작성하세요.`;
+
+interface AllScenesMediaItem {
+  index: number;
+  kind: 'image' | 'video' | 'none';
+  label: string;
+  currentTitle: string;
+}
+
+/** 장면 하나의 등록된 미디어 종류(사진/영상/없음)와 표시용 파일명을 판단합니다. */
+function describeSceneMedia(scene: Scene): { kind: 'image' | 'video' | 'none'; label: string } {
+  if (scene.localVideoName || scene.localVideoUrl) {
+    return { kind: 'video', label: scene.localVideoName || '영상 파일' };
+  }
+  if (scene.localImageName || (scene.photoRef && scene.photoRef.trim())) {
+    return { kind: 'image', label: scene.localImageName || '사진 파일' };
+  }
+  return { kind: 'none', label: '(등록된 사진/영상 없음)' };
+}
+
+function buildAllScenesInstruction(items: AllScenesMediaItem[]): string {
+  const lines = items.map((it) => {
+    const media = it.kind === 'none' ? '(등록된 사진/영상 없음)' : `[${it.kind === 'video' ? '영상' : '사진'}] 파일명: ${it.label}`;
+    return `${it.index + 1}. ${media} / 현재 제목: "${it.currentTitle}"`;
+  });
+
+  return `다음은 전체 타임라인의 장면 목록입니다 (이 순서와 개수를 그대로 유지해 한 장면씩 다시 작성하세요):
+${lines.join('\n')}
+
+아래 형식의 JSON 배열만 출력하세요. 다른 설명, 코드블록 표시(백틱), 여는 말은 절대 포함하지 마세요.
+배열의 길이는 반드시 위 목록과 정확히 같은 ${items.length}개여야 하고, 순서도 동일해야 합니다.
+
+[
+  {
+    "customTitle": "장면 제목 (짧게)",
+    "narration": "나레이션 (2~4문장, 한국어)",
+    "dialogue": "등장인물 대사 (없으면 빈 문자열)"
+  }
+]
+
+규칙:
+- 전체 장면이 하나로 이어지는 영화/다큐멘터리처럼 자연스러운 흐름이어야 합니다.
+- 확인할 수 없는 구체적 사실을 지어내지 마세요.`;
+}
+
+/**
+ * 타임라인의 모든 장면 제목/나레이션/대사를 한 번의 요청으로 다시 씁니다. 반환 배열은
+ * 항상 입력 scenes와 길이·순서가 같습니다(LLM 응답이 부족/초과해도 이 함수가 안전하게
+ * 채우거나 잘라내며, 실패 시에는 기존 장면 내용을 그대로 반환해 절대 장면이 비거나
+ * 사라지지 않습니다).
+ */
+export async function regenerateAllScenesForTimeline(params: {
+  scenes: Scene[];
+  settings: LlmSettings;
+}): Promise<AllScenesRegenerateResult[]> {
+  const { scenes, settings } = params;
+  if (scenes.length === 0) return [];
+
+  const items: AllScenesMediaItem[] = scenes.map((sc, i) => {
+    const media = describeSceneMedia(sc);
+    return { index: i, kind: media.kind, label: media.label, currentTitle: sc.customTitle };
+  });
+
+  const buildMessages = (compressed: boolean): OpenAiMessage[] => [
+    { role: 'system', content: ALL_SCENES_SYSTEM_PROMPT },
+    {
+      role: 'user',
+      content:
+        buildAllScenesInstruction(items) +
+        (compressed ? '\n\n(중요: 각 문자열 값 안에는 절대 줄바꿈을 넣지 말고 한 줄로만 작성하세요.)' : ''),
+    },
+  ];
+
+  // 3차 폴백(절대 실패하지 않음): 기존 장면 내용을 그대로 돌려주므로 안전합니다.
+  const fallback = (): RawStoryboardScene[] =>
+    scenes.map((sc) => ({ customTitle: sc.customTitle, narration: sc.narration, dialogue: sc.dialogue }));
+
+  const raw = await generateJsonWithGuaranteedFallback({
+    settings,
+    temperature: 0.6,
+    buildMessages,
+    baseMaxTokens: estimateStoryboardMaxTokens(scenes.length),
+    fallback,
+  });
+
+  return scenes.map((sc, i) => {
+    const entry = raw[i] ?? {};
+    const narration = typeof entry.narration === 'string' && entry.narration.trim() ? entry.narration.trim() : sc.narration;
+    const dialogue = typeof entry.dialogue === 'string' ? entry.dialogue.trim() : sc.dialogue;
+    const customTitle =
+      typeof entry.customTitle === 'string' && entry.customTitle.trim() ? entry.customTitle.trim() : sc.customTitle;
+    return { id: sc.id, customTitle, narration, dialogue };
+  });
 }

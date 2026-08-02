@@ -37,7 +37,11 @@ export interface BlogMediaMeta {
   id: string;
   postId: string;
   url: string;
-  type: 'image' | 'video';
+  // 2026-08-01 추가: 블로그(KWJMTORY)는 <audio> 태그와 media-meta.json의 type: 'audio'도
+  // 실제로 사용합니다(src/app/lib/audioExtension.ts, mediaMeta.ts 참고). 이전 구현은
+  // 'image' | 'video'만 인식해 오디오 캡션/날짜 데이터가 통째로 누락되었습니다 — 반드시
+  // 'audio'도 포함해야 "정확하게 모든 관련 데이터"를 불러온다는 요구사항을 만족합니다.
+  type: 'image' | 'video' | 'audio';
   order: number;
   caption: string;
   location: string;
@@ -87,7 +91,7 @@ function splitDateParts(iso: string): { year: number; month: string; day: string
 }
 
 interface ParsedMediaTag {
-  type: 'image' | 'video';
+  type: 'image' | 'video' | 'audio';
   src: string;
   mediaId: string | null;
   caption: string;
@@ -95,11 +99,16 @@ interface ParsedMediaTag {
   isThumbnail: boolean;
 }
 
-/** 블로그의 parseMediaTags()와 동일한 규칙으로 본문 HTML에서 <img>/<video> 태그를 추출합니다. */
+/**
+ * 블로그의 parseMediaTags()와 동일한 규칙으로 본문 HTML에서 <img>/<video>/<audio> 태그를
+ * 추출합니다. (2026-08-01: <audio> 추가 — 블로그의 src/app/lib/mediaMeta.ts가 쓰는
+ * `/<(img|video|audio)\b([^>]*)>/gi`와 동일한 태그 집합을 그대로 따라야, 오디오가 첨부된
+ * 글에서도 오디오 캡션/장소/날짜 정보를 놓치지 않습니다.)
+ */
 function parseMediaTagsFromContent(html: string): ParsedMediaTag[] {
   if (!html) return [];
   const results: ParsedMediaTag[] = [];
-  const tagRegex = /<(img|video)\b([^>]*)>/gi;
+  const tagRegex = /<(img|video|audio)\b([^>]*)>/gi;
   let m: RegExpExecArray | null;
   while ((m = tagRegex.exec(html)) !== null) {
     const tagName = m[1].toLowerCase();
@@ -112,7 +121,7 @@ function parseMediaTagsFromContent(html: string): ParsedMediaTag[] {
     const locationMatch = /\sdata-location="([^"]*)"/i.exec(attrs);
     const isThumbnail = /\sdata-thumbnail="true"/i.test(attrs);
     results.push({
-      type: tagName === 'video' ? 'video' : 'image',
+      type: tagName === 'video' ? 'video' : tagName === 'audio' ? 'audio' : 'image',
       src: srcMatch[1],
       mediaId: mediaIdMatch ? decodeHtmlEntities(mediaIdMatch[1]) : null,
       caption: titleMatch ? decodeHtmlEntities(titleMatch[1]) : '',

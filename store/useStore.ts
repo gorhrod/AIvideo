@@ -29,6 +29,10 @@ import {
 } from '@/lib/fsAccess';
 import { readBlogData, type BlogPost, type BlogMediaMeta, type BlogCategory } from '@/lib/blogData';
 
+// 2026-08-02(2): initStorage()의 자동 재연결 시도 중임을 표시하는 localStorage 키.
+// "새 폴더 다시 연결 → 브라우저 강제종료" 버그의 안전장치로 사용됩니다 (initStorage 참고).
+const RECONNECT_IN_PROGRESS_KEY = 'kwjmvideoai_reconnect_in_progress';
+
 // 2026-07-27(3): 폴더 선택/연결 도중 나는 오류가 화면에서 "영원히 로딩 중"으로만 보이던 문제를
 // 고치기 위한 공용 헬퍼입니다. pickDirectory/verifyPermission 등은 사용자가 다이얼로그를
 // 취소한 경우 외에도(예: 브라우저가 사용자 제스처로 인식하지 못해 막는 SecurityError 등)
@@ -96,7 +100,7 @@ export interface Project {
 }
 
 export type ViewState = 'chat' | 'editor';
-export type ModalState = null | 'new-project' | 'load' | 'export' | 'media' | 'settings' | 'blog-import' | 'import';
+export type ModalState = null | 'new-project' | 'export' | 'media' | 'settings' | 'blog-import';
 
 export type LlmStatus = 'unknown' | 'checking' | 'online' | 'offline';
 /** 빠른모드: 속도 위주(짧은 생성, 응답이 가장 빠름) · 보통모드: 가성비(기본값) · 전문가모드: 토큰을 많이 써서 더 길고 자세한 결과 */
@@ -148,6 +152,46 @@ const README_CONTENT = `KWJMvideoAI 저장 폴더
 
 function genId(prefix: string): string {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/**
+ * 2026-08-02 추가: 영상 파일(objectURL)의 실제 재생 길이(초)를 알아냅니다.
+ * "영상인 경우 재생시간을 영상 길이에 고정한다"는 요구사항 때문에, 영상을 장면에 적용할 때마다
+ * 이 함수로 실제 길이를 읽어 scene.duration에 그대로 반영합니다(0.1초 단위로 반올림).
+ * 브라우저의 <video> 엘리먼트로만 알 수 있어 클라이언트에서만 동작하며, 메타데이터를 읽지
+ * 못하면(코덱 문제 등) null을 반환해 호출부가 기존 duration을 그대로 쓰도록 합니다.
+ */
+export function getVideoDurationSeconds(url: string): Promise<number | null> {
+  return new Promise((resolve) => {
+    if (typeof document === 'undefined') {
+      resolve(null);
+      return;
+    }
+    const videoEl = document.createElement('video');
+    videoEl.preload = 'metadata';
+    videoEl.muted = true;
+    let settled = false;
+    const finish = (value: number | null) => {
+      if (settled) return;
+      settled = true;
+      videoEl.removeAttribute('src');
+      videoEl.load();
+      resolve(value);
+    };
+    videoEl.onloadedmetadata = () => {
+      const d = videoEl.duration;
+      finish(Number.isFinite(d) && d > 0 ? d : null);
+    };
+    videoEl.onerror = () => finish(null);
+    // 메타데이터를 끝내 못 받는 경우(일부 코덱/브라우저)를 대비한 안전장치
+    setTimeout(() => finish(null), 4000);
+    videoEl.src = url;
+  });
+}
+
+/** 재생시간을 0.1초 단위로 반올림합니다 (슬라이더 step=0.1과 맞춤). */
+function roundToTenth(n: number): number {
+  return Math.round(n * 10) / 10;
 }
 
 /**
@@ -226,6 +270,12 @@ interface AppState {
   uploadPhotoToScene: (id: string, file: File) => Promise<{ ok: boolean; message?: string }>;
   /** uploadPhotoToScene과 동일하지만 영상 파일용입니다. */
   uploadVideoToScene: (id: string, file: File) => Promise<{ ok: boolean; message?: string }>;
+  /** 2026-08-02 추가: 장면에 등록/적용된 사진·영상을 모두 해제합니다("다시 한번 눌러서
+   *  등록 취소" 토글용) — photoRef/localImageName/localVideoName/localVideoUrl을 전부 비웁니다. */
+  clearSceneMedia: (id: string) => void;
+  /** 2026-08-02 추가: "타임라인 전체 AI로 생성" — 여러 장면의 제목/나레이션/대사를 한 번에
+   *  갱신하고 저장 이력/자동저장을 한 번만 트리거합니다(장면 수만큼 updateScene을 반복 호출하지 않음). */
+  applyBulkSceneContent: (updates: { id: string; customTitle: string; narration: string; dialogue: string }[]) => void;
 
   selectedSceneId: string | null;
   setSelectedSceneId: (id: string | null) => void;
@@ -236,6 +286,10 @@ interface AppState {
   chatMessages: ChatMessage[];
   addChatMessage: (role: 'user' | 'assistant', text: string) => void;
   setChatMessages: (messages: ChatMessage[]) => void;
+  /** 2026-08-01: 헤더의 채팅 탭에서 "채팅기록 초기화" 버튼으로 호출됩니다 — 채팅 기록만
+   *  처음 인사 메시지로 되돌리고, 만들어둔 장면/프로젝트는 그대로 둡니다(다시 채팅부터
+   *  시작해서 새 스토리보드 내용을 만들 수 있도록). */
+  resetChatHistory: () => void;
 
   editLog: EditLogEntry[];
   pushEditLog: (type: string, message: string) => void;
@@ -321,6 +375,10 @@ interface AppState {
 
 export const useStore = create<AppState>((set, get) => {
   let autosaveTimer: ReturnType<typeof setTimeout> | null = null;
+  // 2026-08-01: 저장 폴더 연결이 잠깐 끊기거나(권한 재확인 실패 등) 쓰기가 실패했을 때,
+  // 사용자가 다시 편집하지 않아도 스스로 재시도해서 임시저장이 계속 유지되도록 합니다.
+  // "폴더연결이 중간에 끊기지 않게 계속 임시저장이 잘 되는지" 요구사항에 대응합니다.
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
   const scheduleAutosave = () => {
     const state = get();
@@ -329,6 +387,18 @@ export const useStore = create<AppState>((set, get) => {
     autosaveTimer = setTimeout(() => {
       get().saveAllToFolder({ silent: true });
     }, 1500);
+  };
+
+  /** 저장이 실패했을 때 8초 뒤 조용히 한 번 더 시도합니다. 이미 예약되어 있으면 중복
+   *  예약하지 않고, 폴더 연결이 끊기거나 자동저장이 꺼지면 스스로 멈춥니다. */
+  const scheduleErrorRetry = () => {
+    if (retryTimer) return;
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      const state = get();
+      if (!state.saveDirHandle || !state.autoSaveEnabled) return;
+      get().saveAllToFolder({ silent: true });
+    }, 8000);
   };
 
   const addLogEntry = (type: string, message: string) => {
@@ -372,6 +442,12 @@ export const useStore = create<AppState>((set, get) => {
         saveStatus: 'idle',
         saveError: null,
       });
+      // 2026-08-01: 폴더가 (다시) 정상 연결됐으니, 이전 실패로 예약해둔 자동 재시도는
+      // 더 이상 필요 없습니다.
+      if (retryTimer) {
+        clearTimeout(retryTimer);
+        retryTimer = null;
+      }
 
       if (appState && Array.isArray(appState.scenes) && appState.scenes.length > 0) {
         set({
@@ -398,6 +474,21 @@ export const useStore = create<AppState>((set, get) => {
         get()
           .resyncMediaReferences()
           .catch((err) => console.error(err));
+      } else if (source === 'external') {
+        // 2026-08-02 추가: "등록한 폴더에 자료가 없으면 빈 데이터를 다시 생성해야 한다"는
+        // 요구사항 — 이 폴더에는 아직 저장된 장면 데이터가 없으므로(완전히 새 폴더이거나,
+        // 비어있는 폴더를 새로 연결한 경우), 이전에 메모리에 남아있던 다른 폴더/세션의
+        // 장면·프로젝트·채팅이 이 폴더로 섞여 저장되지 않도록 빈 스토리보드로 확실히
+        // 초기화합니다. 헤더의 "가져오기"가 더 이상 별도의 "프로젝트 불러오기" 목록을
+        // 제공하지 않는 대신, 폴더 연결 자체가 곧 "이 폴더의 프로젝트 열기"이기 때문에
+        // 이 초기화가 중요합니다.
+        set({
+          scenes: [],
+          selectedSceneId: null,
+          currentProject: null,
+          chatMessages: [INITIAL_CHAT_MESSAGE],
+          editLog: [],
+        });
       }
       if (chatData && Array.isArray(chatData.messages) && chatData.messages.length > 0) {
         set({ chatMessages: chatData.messages });
@@ -414,6 +505,14 @@ export const useStore = create<AppState>((set, get) => {
       );
 
       const restored = Boolean(appState || chatData);
+      if (source === 'external' && !restored) {
+        // 빈 폴더에 새로 연결한 경우, 방금 초기화한 빈 데이터를 즉시 실제 파일로도
+        // 만들어둡니다(사용자가 아무 편집도 하지 않은 채 폴더만 열어봐도 KWJMvideoAI_data
+        // 안에 app_state.json 등 빈 데이터 파일이 바로 보이도록).
+        get()
+          .saveAllToFolder({ silent: true })
+          .catch((err) => console.error(err));
+      }
       return {
         ok: true,
         message:
@@ -492,6 +591,11 @@ export const useStore = create<AppState>((set, get) => {
       addLogEntry('scene_add', '새 장면 추가');
       scheduleAutosave();
     },
+    // 2026-08-02: 사진/영상은 한 장면에 하나만 등록될 수 있어야 하므로(타임라인에 중복
+    // 등록되던 버그의 원인 — 사진을 적용해도 이전에 적용된 영상 참조가 그대로 남아있었음),
+    // 사진을 적용하면 기존 영상 참조(localVideoName/localVideoUrl)를 항상 함께 지웁니다.
+    // 재생시간은 영상 전용 잠금(아래 applyLocalVideoToScene 참고)에서 벗어나는 것이므로
+    // 0.1~10초 범위로 안전하게 다시 맞춥니다.
     applyImageToScene: (id, photoRef, opts) => {
       set((s) => ({
         scenes: s.scenes.map((sc) =>
@@ -500,6 +604,9 @@ export const useStore = create<AppState>((set, get) => {
                 ...sc,
                 photoRef,
                 localImageName: opts?.localImageName ?? undefined,
+                localVideoName: undefined,
+                localVideoUrl: undefined,
+                duration: Math.min(10, Math.max(0.1, sc.duration || 5)),
                 ...(opts && 'sourcePostId' in opts ? { sourcePostId: opts.sourcePostId ?? undefined } : {}),
                 ...(opts && 'sourceMediaId' in opts ? { sourceMediaId: opts.sourceMediaId ?? undefined } : {}),
               }
@@ -509,14 +616,66 @@ export const useStore = create<AppState>((set, get) => {
       addLogEntry('image_apply', opts?.logMessage ?? '장면 이미지 교체');
       scheduleAutosave();
     },
+    // 2026-08-02: 영상을 적용하면 기존 사진 참조(photoRef/localImageName)를 지우고(위와 같은
+    // 이유), 실제 영상 길이를 읽어 재생시간을 그 길이에 "고정"합니다 — 사용자가 지정한
+    // 재생시간 상한(10초)과 무관하게 영상 길이를 그대로 씁니다("제한시간 상관없이 영상시간에
+    // 맞추기" 요구사항).
     applyLocalVideoToScene: async (id, fileEntry) => {
       const url = await fileHandleToObjectUrl(fileEntry.handle);
+      const videoDuration = await getVideoDurationSeconds(url);
       set((s) => ({
         scenes: s.scenes.map((sc) =>
-          sc.id === id ? { ...sc, localVideoName: fileEntry.name, localVideoUrl: url } : sc
+          sc.id === id
+            ? {
+                ...sc,
+                localVideoName: fileEntry.name,
+                localVideoUrl: url,
+                photoRef: '',
+                localImageName: undefined,
+                sourcePostId: undefined,
+                sourceMediaId: undefined,
+                duration: videoDuration ? roundToTenth(videoDuration) : sc.duration,
+              }
+            : sc
         ),
       }));
-      addLogEntry('video_apply', `장면에 로컬 영상 연결: ${fileEntry.name}`);
+      addLogEntry(
+        'video_apply',
+        `장면에 로컬 영상 연결: ${fileEntry.name}${videoDuration ? ` (영상 길이 ${roundToTenth(videoDuration)}초에 재생시간 고정)` : ''}`
+      );
+      scheduleAutosave();
+    },
+    clearSceneMedia: (id) => {
+      const target = get().scenes.find((sc) => sc.id === id);
+      set((s) => ({
+        scenes: s.scenes.map((sc) =>
+          sc.id === id
+            ? {
+                ...sc,
+                photoRef: '',
+                localImageName: undefined,
+                localVideoName: undefined,
+                localVideoUrl: undefined,
+                sourcePostId: undefined,
+                sourceMediaId: undefined,
+                duration: Math.min(10, Math.max(0.1, sc.duration || 5)),
+              }
+            : sc
+        ),
+      }));
+      addLogEntry('media_clear', `"${target?.customTitle ?? id}" 장면에 등록된 사진/영상 등록 취소`);
+      scheduleAutosave();
+    },
+    applyBulkSceneContent: (updates) => {
+      if (updates.length === 0) return;
+      const byId = new Map(updates.map((u) => [u.id, u]));
+      set((s) => ({
+        scenes: s.scenes.map((sc) => {
+          const u = byId.get(sc.id);
+          return u ? { ...sc, customTitle: u.customTitle, narration: u.narration, dialogue: u.dialogue } : sc;
+        }),
+      }));
+      addLogEntry('scene_ai_regenerate_all', `타임라인 전체 AI 생성 — 장면 ${updates.length}개의 제목/나레이션/대사를 새로 작성함`);
       scheduleAutosave();
     },
 
@@ -543,7 +702,18 @@ export const useStore = create<AppState>((set, get) => {
         await writeBinaryFile(mediaDir, fileName, file);
         const url = URL.createObjectURL(file);
         set((s) => ({
-          scenes: s.scenes.map((sc) => (sc.id === id ? { ...sc, photoRef: url, localImageName: fileName } : sc)),
+          scenes: s.scenes.map((sc) =>
+            sc.id === id
+              ? {
+                  ...sc,
+                  photoRef: url,
+                  localImageName: fileName,
+                  localVideoName: undefined,
+                  localVideoUrl: undefined,
+                  duration: Math.min(10, Math.max(0.1, sc.duration || 5)),
+                }
+              : sc
+          ),
         }));
         addLogEntry('image_apply', `장면에 사진 등록(파일 업로드): ${fileName} → "${projectName}" 프로젝트 미디어 폴더에 저장됨`);
         scheduleAutosave();
@@ -567,12 +737,27 @@ export const useStore = create<AppState>((set, get) => {
         const fileName = buildUniqueMediaFileName(file.name);
         await writeBinaryFile(mediaDir, fileName, file);
         const url = URL.createObjectURL(file);
+        const videoDuration = await getVideoDurationSeconds(url);
         set((s) => ({
           scenes: s.scenes.map((sc) =>
-            sc.id === id ? { ...sc, localVideoName: fileName, localVideoUrl: url } : sc
+            sc.id === id
+              ? {
+                  ...sc,
+                  localVideoName: fileName,
+                  localVideoUrl: url,
+                  photoRef: '',
+                  localImageName: undefined,
+                  sourcePostId: undefined,
+                  sourceMediaId: undefined,
+                  duration: videoDuration ? roundToTenth(videoDuration) : sc.duration,
+                }
+              : sc
           ),
         }));
-        addLogEntry('video_apply', `장면에 영상 등록(파일 업로드): ${fileName} → "${projectName}" 프로젝트 미디어 폴더에 저장됨`);
+        addLogEntry(
+          'video_apply',
+          `장면에 영상 등록(파일 업로드): ${fileName} → "${projectName}" 프로젝트 미디어 폴더에 저장됨${videoDuration ? ` (영상 길이 ${roundToTenth(videoDuration)}초에 재생시간 고정)` : ''}`
+        );
         scheduleAutosave();
         return { ok: true, message: `영상이 "${projectName}" 프로젝트 폴더 안 media 폴더에 저장되었습니다.` };
       } catch (err) {
@@ -607,6 +792,11 @@ export const useStore = create<AppState>((set, get) => {
       scheduleAutosave();
     },
     setChatMessages: (messages) => set({ chatMessages: messages }),
+    resetChatHistory: () => {
+      set({ chatMessages: [INITIAL_CHAT_MESSAGE] });
+      addLogEntry('chat_reset', '채팅기록을 초기화하고 새로 채팅을 시작함');
+      scheduleAutosave();
+    },
 
     editLog: [],
     pushEditLog: (type, message) => {
@@ -626,21 +816,74 @@ export const useStore = create<AppState>((set, get) => {
 
     initStorage: async () => {
       if (get().saveDirHandle) return; // 이미 이번 세션에 연결됨
+
+      // 2026-08-02(2): "폴더 연결 해제 → 새 폴더로 다시 연결" 이후 브라우저가 강제 종료되는
+      // 버그의 두 번째 원인에 대한 안전장치입니다. 기억해둔 폴더로 자동 재연결을 시도하는
+      // 도중에 탭/브라우저가 죽어버리면, 다음에 앱을 열 때도 똑같이 그 폴더로 자동
+      // 재연결을 시도해서 같은 문제가 매번 반복될 수 있었습니다. 그래서 재연결을
+      // "시도하기 직전"에 플래그를 남겨두고 "끝까지 성공/실패가 확정된 뒤"에만 지웁니다.
+      // 다음 실행 때 이 플래그가 여전히 남아있다면 지난번 시도가 끝까지 완료되지 못했다는
+      // 뜻이므로(비정상 종료), 이번에는 같은 폴더로 자동 재시도하지 않고 스스로 포기하며
+      // 기억해둔 폴더 참조도 함께 지웁니다 — 문제 있는 폴더에 계속 갇히지 않기 위함입니다.
+      // sessionStorage가 아니라 localStorage를 쓰는 이유는 탭이 죽는 경우(강제 종료)
+      // sessionStorage도 함께 사라져 신호가 남지 않기 때문입니다.
+      let reconnectFlagWasStuck = false;
       try {
-        const remembered = await getRememberedDirectoryHandle(REMEMBERED_SAVE_DIR_KEY);
-        if (remembered) {
-          set({ rememberedSaveDirName: remembered.name ?? null });
-          // 사용자 제스처 없이 조용히 권한만 확인합니다 (다이얼로그 없음). 이미 허용되어 있으면
-          // 바로 재연결하고, 아니면 StorageBar에 "다시 연결" 안내를 띄웁니다.
-          const alreadyGranted = await queryPermissionSilently(remembered, 'readwrite');
-          if (alreadyGranted) {
-            const res = await attachSaveDir(remembered, 'external', remembered.name ?? '저장 폴더');
-            if (res.ok) return;
-          }
+        if (typeof localStorage !== 'undefined') {
+          reconnectFlagWasStuck = localStorage.getItem(RECONNECT_IN_PROGRESS_KEY) === '1';
         }
       } catch (err) {
         console.error(err);
       }
+
+      if (reconnectFlagWasStuck) {
+        console.error(
+          '[storage] 지난번 저장 폴더 자동 재연결이 끝까지 완료되지 않았습니다. 문제가 될 수 있는 폴더 기억을 지우고 자동 재연결을 건너뜁니다.'
+        );
+        try {
+          await forgetRememberedDirectoryHandle(REMEMBERED_SAVE_DIR_KEY);
+        } catch (err) {
+          console.error(err);
+        }
+        try {
+          if (typeof localStorage !== 'undefined') localStorage.removeItem(RECONNECT_IN_PROGRESS_KEY);
+        } catch (err) {
+          console.error(err);
+        }
+        set({ rememberedSaveDirName: null });
+      } else {
+        try {
+          const remembered = await getRememberedDirectoryHandle(REMEMBERED_SAVE_DIR_KEY);
+          if (remembered) {
+            set({ rememberedSaveDirName: remembered.name ?? null });
+            // 사용자 제스처 없이 조용히 권한만 확인합니다 (다이얼로그 없음). 이미 허용되어 있으면
+            // 바로 재연결하고, 아니면 StorageBar에 "다시 연결" 안내를 띄웁니다.
+            const alreadyGranted = await queryPermissionSilently(remembered, 'readwrite');
+            if (alreadyGranted) {
+              try {
+                if (typeof localStorage !== 'undefined') localStorage.setItem(RECONNECT_IN_PROGRESS_KEY, '1');
+              } catch (err) {
+                console.error(err);
+              }
+              const res = await attachSaveDir(remembered, 'external', remembered.name ?? '저장 폴더');
+              try {
+                if (typeof localStorage !== 'undefined') localStorage.removeItem(RECONNECT_IN_PROGRESS_KEY);
+              } catch (err) {
+                console.error(err);
+              }
+              if (res.ok) return;
+            }
+          }
+        } catch (err) {
+          console.error(err);
+          try {
+            if (typeof localStorage !== 'undefined') localStorage.removeItem(RECONNECT_IN_PROGRESS_KEY);
+          } catch {
+            // 무시
+          }
+        }
+      }
+
       // 기억해둔 폴더가 없거나 조용히 재연결하지 못했으면, 폴더 선택 없이도 바로 자동저장이
       // 되도록 브라우저 내부 자동 저장소(OPFS)에 연결합니다.
       try {
@@ -698,7 +941,32 @@ export const useStore = create<AppState>((set, get) => {
         clearTimeout(autosaveTimer);
         autosaveTimer = null;
       }
-      set({ saveDirHandle: null, saveDirName: null, saveDirSource: null, saveStatus: 'idle', saveError: null });
+      if (retryTimer) {
+        clearTimeout(retryTimer);
+        retryTimer = null;
+      }
+      // 2026-08-02(2) 버그 수정: 예전에는 여기서 메모리 상태(saveDirHandle 등)만 지우고
+      // IndexedDB에 남아있는 "기억해둔 폴더" 참조(REMEMBERED_SAVE_DIR_KEY)는 그대로
+      // 두고 있었습니다. 그래서 연결을 끊은 뒤 다시 연결 화면으로 가면 rememberedSaveDirName이
+      // 계속 남아있는 채로, FolderConnectGate/StorageBar가 항상 "이전 폴더로 다시 연결"만
+      // 시도하고 진짜 "새 폴더 선택" 창을 띄울 방법이 없었습니다(그 폴더가 이동/삭제/손상된
+      // 상태면 재연결 시도 자체가 반복적으로 실패하며 강제종료로 이어질 수 있었습니다).
+      // 연결을 끊을 때 기억해둔 참조도 함께 지워서, 다음에는 항상 "새 폴더 선택" 창이 바로
+      // 뜨도록 합니다.
+      forgetRememberedDirectoryHandle(REMEMBERED_SAVE_DIR_KEY).catch((err) => console.error(err));
+      try {
+        if (typeof localStorage !== 'undefined') localStorage.removeItem(RECONNECT_IN_PROGRESS_KEY);
+      } catch (err) {
+        console.error(err);
+      }
+      set({
+        saveDirHandle: null,
+        saveDirName: null,
+        saveDirSource: null,
+        rememberedSaveDirName: null,
+        saveStatus: 'idle',
+        saveError: null,
+      });
     },
 
     saveAllToFolder: async (opts) => {
@@ -710,7 +978,14 @@ export const useStore = create<AppState>((set, get) => {
       try {
         const granted = await verifyPermission(state.saveDirHandle, 'readwrite');
         if (!granted) {
-          set({ saveStatus: 'error', saveError: '폴더 쓰기 권한이 없습니다.' });
+          // 2026-08-01: 권한 확인에 실패하면(폴더가 옮겨지거나 브라우저가 권한을 잊는 등)
+          // 배너로 눈에 띄게 안내하고, 8초 뒤 자동으로 다시 시도합니다 — 사용자가 아무
+          // 조작을 하지 않아도 연결이 스스로 복구될 가능성을 놓치지 않기 위해서입니다.
+          set({
+            saveStatus: 'error',
+            saveError: '폴더 쓰기 권한이 없습니다. 폴더 연결이 끊어졌을 수 있어요 — "다시 연결"을 눌러주세요.',
+          });
+          scheduleErrorRetry();
           return { ok: false, message: '폴더 쓰기 권한이 없습니다.' };
         }
         const dataDir = await getDataDir(state.saveDirHandle);
@@ -744,10 +1019,19 @@ export const useStore = create<AppState>((set, get) => {
         await writeJsonFile(dataDir, EDIT_LOG_FILE, logPayload);
 
         set({ saveStatus: 'saved', saveError: null, lastSavedAt: now });
+        if (retryTimer) {
+          clearTimeout(retryTimer);
+          retryTimer = null;
+        }
         return { ok: true };
       } catch (err: any) {
         console.error(err);
-        set({ saveStatus: 'error', saveError: '저장 중 문제가 발생했습니다.' });
+        // 2026-08-01: 실제 오류 메시지를 함께 남기고, 8초 뒤 자동으로 재시도를 예약합니다.
+        set({
+          saveStatus: 'error',
+          saveError: `저장 중 문제가 발생했습니다${err?.message ? `: ${err.message}` : ''}`,
+        });
+        scheduleErrorRetry();
         return { ok: false, message: '저장 중 문제가 발생했습니다.' };
       }
     },
